@@ -1,19 +1,22 @@
-#include <cstdint>
 #include <format>
 #include <iostream>
-#include <string>
 
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include <wolf.h>
 
 namespace wolf {
 
-// TCP
+/// TcpListener
+
+/// Creates a socket and tries to start listening
+/// The socket is marked as nonblocking
 TcpListener::TcpListener(std::string host, uint16_t port)
     : host_(host), port_(port) {
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -49,15 +52,35 @@ TcpListener::TcpListener(std::string host, uint16_t port)
     }
 
     freeaddrinfo(addrinfo);
+
+    // set nonblock
+    int flags = fcntl(fd_, F_GETFL);
+    if (flags < 0) {
+        // handle error
+        std::cout << "fcntl error\n";
+    }
+
+    err = fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+    if (err < 0) {
+        // handle error
+        std::cout << "fcntl error\n";
+    }
 };
 
-int TcpClient::send(const std::string &str) {
-    std::cout << "sent " << str << std::endl;
+/// Closes the socket
+TcpListener::~TcpListener() {
+    if (close(fd_) < 0) {
+        // handle error
+    }
+}
 
+int TcpListener::accept() {
     return 0;
 }
 
-// Event Loop
+/// Event Loop
+
+/// Initialise epoll
 EventLoop::EventLoop() {
     epollfd_ = epoll_create1(0);
     if (epollfd_ < 0) {
@@ -67,9 +90,12 @@ EventLoop::EventLoop() {
 
 void EventLoop::attatchListener(TcpListener &listener) {
     struct epoll_event epoll_event;
+
     epoll_event.events = EPOLLIN | EPOLLOUT | EPOLLET;
-    EpollData& epd = epoll_data_.emplace_back(listener.getFD(), &listener, true);
-    epoll_event.data.ptr = &epd;
+
+    Ctx *ctx = new Ctx(listener, listener.getFD(), true, nullptr);
+    epoll_event.data.ptr = ctx;
+
     int err =
         epoll_ctl(epollfd_, EPOLL_CTL_ADD, listener.getFD(), &epoll_event);
     if (err < 0) {
@@ -80,27 +106,16 @@ void EventLoop::attatchListener(TcpListener &listener) {
 void EventLoop::pollIO(int timeout) {
     struct epoll_event epoll_events[1024];
     int nfds = epoll_wait(epollfd_, epoll_events, 1024, timeout);
-    if (nfds < 0) {
-        // handle error
-    }
 
     for (int i = 0; i < nfds; i++) {
-        struct EpollData *epd = (struct EpollData *)epoll_events[i].data.ptr;
+        struct epoll_event ev = epoll_events[i];
+        Ctx *ctx = (Ctx *)ev.data.ptr;
 
-        // is a listener?
-        if (epd->is_listener) {
-            TcpListener *listener = epd->ptr.listener;
-
-            // accept
-            struct sockaddr sockaddr;
-            socklen_t addrlen = 0;
-            int fd = accept(epd->fd, &sockaddr, &addrlen);
-            if (fd < 0) {
-                // handle error
-                std::cout << "accept error\n";
+        if (ev.events & EPOLLIN) {
+            if (ctx->is_listener) {
+                ctx->listener.on_connect(*this, ctx->listener);
+            } else {
             }
-            TcpClient &client = listener->addClient(fd, sockaddr);
-            listener->onAccept(client);
         }
     }
 }
