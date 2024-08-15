@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 
 namespace wolf {
@@ -32,9 +33,12 @@ public:
     ~TcpListener();
 
     int getFD() { return fd_; }
-    int accept();
+    std::optional<int> accept();
+    void closeClient(int client);
 
     std::function<void(EventLoop &loop, TcpListener &listener)> on_connect;
+    std::function<void(EventLoop &loop, Ctx &ctx)> on_readable;
+    std::function<void(EventLoop &loop, Ctx &ctx)> on_writeable;
 
 private:
     std::string host_;
@@ -47,6 +51,9 @@ public:
     EventLoop();
     int run();
     void attatchListener(TcpListener &listener);
+
+    void watch(int client, TcpListener &listener, void *data);
+    void unwatch(int client);
 
 private:
     void pollIO(int timeout);

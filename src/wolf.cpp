@@ -1,5 +1,8 @@
+#include <asm-generic/socket.h>
+#include <cerrno>
 #include <format>
 #include <iostream>
+#include <optional>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -19,14 +22,20 @@ namespace wolf {
 /// The socket is marked as nonblocking
 TcpListener::TcpListener(std::string host, uint16_t port)
     : host_(host), port_(port) {
-    fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd_ < 0) {
         // handle error
         std::cout << "socket err\n";
     }
 
+    int val = 1;
+    int err = setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (void*)&val, sizeof(val));
+    if (err != 0) {
+        // TODO handle error
+    }
+
     struct addrinfo *addrinfo;
-    int err = getaddrinfo(host.c_str(), std::to_string(port).c_str(), NULL,
+    err = getaddrinfo(host.c_str(), std::to_string(port).c_str(), NULL,
                           &addrinfo);
     if (err != 0) {
         // handle error
@@ -52,19 +61,6 @@ TcpListener::TcpListener(std::string host, uint16_t port)
     }
 
     freeaddrinfo(addrinfo);
-
-    // set nonblock
-    int flags = fcntl(fd_, F_GETFL);
-    if (flags < 0) {
-        // handle error
-        std::cout << "fcntl error\n";
-    }
-
-    err = fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
-    if (err < 0) {
-        // handle error
-        std::cout << "fcntl error\n";
-    }
 };
 
 /// Closes the socket
@@ -74,8 +70,22 @@ TcpListener::~TcpListener() {
     }
 }
 
-int TcpListener::accept() {
-    return 0;
+std::optional<int> TcpListener::accept() {
+    int client = accept4(fd_, NULL, NULL, SOCK_NONBLOCK);
+    if (client < 0) {
+        // check if blocking
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return {};
+
+        // TODO handle error
+    }
+    return client;
+}
+
+void TcpListener::closeClient(int client) {
+    if (close(client) < 0) {
+        // TODO handle error
+    }
 }
 
 /// Event Loop
@@ -103,19 +113,50 @@ void EventLoop::attatchListener(TcpListener &listener) {
     }
 }
 
+/// Adds a client to a watchlist
+/// Allocates a Ctx struct which is managed internally
+/// data is managed by the caller
+void EventLoop::watch(int client, TcpListener &listener, void *data) {
+    Ctx *ctx = new Ctx(listener, client, false, data);
+
+    struct epoll_event ev;
+    ev.data.ptr = ctx;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+    if (epoll_ctl(epollfd_, EPOLL_CTL_ADD, client, &ev) < 0) {
+        // TODO handle error     
+    }
+}
+
+void EventLoop::unwatch(int client) {
+    if (epoll_ctl(epollfd_, EPOLL_CTL_DEL, client, nullptr) < 0) {
+        // TODO handle error
+    }
+}
+
 void EventLoop::pollIO(int timeout) {
     struct epoll_event epoll_events[1024];
     int nfds = epoll_wait(epollfd_, epoll_events, 1024, timeout);
 
-    for (int i = 0; i < nfds; i++) {
-        struct epoll_event ev = epoll_events[i];
-        Ctx *ctx = (Ctx *)ev.data.ptr;
+    for (epoll_event *ev = epoll_events; ev < epoll_events + nfds; ev++) {
+        Ctx *ctx = (Ctx *)ev->data.ptr;
 
-        if (ev.events & EPOLLIN) {
+        if (ev->events & EPOLLRDHUP) {
+            unwatch(ctx->fd);
+            ctx->listener.closeClient(ctx->fd);
+            delete ctx;
+            std::cout << "holdup\n";
+        } else if (ev->events & EPOLLIN) {
             if (ctx->is_listener) {
                 ctx->listener.on_connect(*this, ctx->listener);
             } else {
+                ctx->listener.on_readable(*this, *ctx);
             }
+            std::cout << "readable\n";
+        } else if (ev->events & EPOLLOUT) {
+            ctx->listener.on_writeable(*this, *ctx);
+            std::cout << "writeable\n";
+        } else {
+            std::cout << "epoll unknown event\n";
         }
     }
 }
