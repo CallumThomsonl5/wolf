@@ -21,7 +21,7 @@ public:
 template <typename T>
 class List {
 public:
-    List() = default;
+    List();
     List(std::initializer_list<T> init);
 
     List(const List &list);
