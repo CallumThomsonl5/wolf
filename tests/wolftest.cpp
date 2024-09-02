@@ -1,55 +1,61 @@
+#include <string>
 #include <iostream>
-#include <optional>
-#include <unistd.h>
+
 #include <wolf.h>
 
-#include <unistd.h>
+// testing
 #include <sys/socket.h>
+#include <unistd.h>
 
-struct UserCtx {
-    int shit;
-};
+// fake http example
+// enum class HttpResult { ERROR, INCOMPLETE, COMPLETE };
 
-void onConnect(wolf::EventLoop &loop, wolf::TcpListener &listener) {
-    std::cout << "listener with fd " << listener.getFD()
-                  << " received connection" << std::endl;
+// HttpResult parse_http(const std::uint8_t *buf, size_t &offt) {
+//     offt = 10;
+//     return HttpResult::COMPLETE;
+// }
 
-    std::optional<int> client_opt = listener.accept();
-    if (!client_opt.has_value()) return;
-    int client = client_opt.value();
+// void on_recv(wolf::Client &client) {
+//     size_t offt = 0;
+//     HttpResult result = parse_http(client.recv_buf(), offt);
+//     switch (result) {
+//     case HttpResult::COMPLETE:
+//     {
+//         // std::string data = "HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\ncall me if they die";
+//         std::string data = "HTTP/1.1 200 OK\r\nContent-Length: ";
+//         std::string content = "fuck you bitch cunt";
+//         data.append(std::to_string(content.size()) + "\r\n\r\n");
+//         data.append(content);
+//         client.send(std::move(data));
+//         // client.recv_buf_shift_down(offt);
+//         break;
+//     }
+//     case HttpResult::ERROR:
+//         client.close();
+//         break;
+//     default:
+//         break;
+//     }
+// }
 
-    std::cout << "accepted client with fd " << client << std::endl;
+void on_connect(wolf::TcpListener &listener) {
+    std::cout << "on_connect called\n";
 
-    UserCtx *user_ctx = new UserCtx();
-    user_ctx->shit = 5;
-    loop.watch(client, listener, user_ctx);
+    wolf::Client *client = listener.accept();
+    if (!client) {
+        return;
+    }
+
+    // client->recv(on_recv);
 }
 
-void onReadable(wolf::EventLoop &loop, wolf::Ctx &ctx) {
-    std::uint8_t buf[1024] = {0};
-    int n = recv(ctx.fd, buf, sizeof(buf) - 1, 0);
-    std::cout << "got data from client: " << buf << "\n";
-}
-
-void onWriteable(wolf::EventLoop &loop, wolf::Ctx &ctx) {
-    std::string hello{"hello world"};
-    send(ctx.fd, hello.c_str(), hello.size(), 0);
-}
-
-int main() {
-    wolf::displayVersion();
-
+int main(void) {
     wolf::EventLoop loop;
-
-    wolf::TcpListener tcp_listener("localhost", 4444);
-    tcp_listener.on_connect = onConnect;
-    tcp_listener.on_readable = onReadable;
-    tcp_listener.on_writeable = onWriteable;
-    loop.attatchListener(tcp_listener);
-
+    wolf::TcpListener listener("localhost", 4444, on_connect);
+    
+    loop.attach(listener);
     loop.run();
 
-    std::cout << "hello world";
 
     return 0;
 }

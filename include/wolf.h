@@ -2,67 +2,139 @@
 #define WOLF_H_INCLUDED
 
 #include <cstdint>
+#include <exception>
 #include <functional>
-#include <optional>
 #include <string>
+
+#include <list.h>
 
 namespace wolf {
 
-const int WOLF_MAJOR_VERSION = 0;
-const int WOLF_MINOR_VERSION = 0;
-const int WOLF_PATCH_VERSION = 1;
-
-// Forward declaration
+// Forward declarations
 class EventLoop;
 class TcpListener;
 
-struct Ctx {
-    Ctx(TcpListener &listener__, int fd__, bool is_listener__, void *data__)
-        : listener(listener__), fd(fd__), is_listener(is_listener__),
-          data(data__) {}
+// exceptions
+class EpollException : public std::exception {
+public:
+    EpollException(const std::string &msg) : msg_(msg) {}
+    const char *what() const noexcept override { return msg_.c_str(); }
 
-    TcpListener &listener;
-    int fd;
-    bool is_listener;
-    void *data;
+private:
+    const std::string msg_;
 };
 
-class TcpListener {
+class ListenerException : public std::exception {
 public:
-    TcpListener(std::string host, std::uint16_t port);
+    ListenerException(const std::string &msg) : msg_(msg) {}
+    const char *what() const noexcept override { return msg_.c_str(); }
+
+private:
+    const std::string msg_;
+};
+
+class AcceptException : public std::exception {
+public:
+    AcceptException(const std::string &msg) : msg_(msg) {}
+    const char *what() const noexcept override { return msg_.c_str(); }
+
+private:
+    const std::string msg_;
+};
+
+enum class EpollType { Client, Listener };
+class EpollBase {
+public:
+    virtual EpollType get_type() const = 0;
+    // virtual ~EpollBase() = 0;
+};
+
+class Client : public EpollBase {
+public:
+    using on_recv_t = std::function<void(Client &client)>;
+
+    Client();
+    Client(int fd, TcpListener *listener, EventLoop *loop);
+    ~Client();
+
+    EpollType get_type() const override { return EpollType::Client; }
+    int fd() const { return fd_; }
+
+    void close();
+
+    void recv(on_recv_t on_recv);
+    void stop_recv();
+    void clear_recv_buf();
+    const std::uint8_t *recv_buf() const { return recv_buf_; }
+
+    void send(std::string msg);
+    void clear_send_buf();
+
+    ListNode<Client> *node = nullptr;
+
+private:
+    int fd_ = -1;
+
+    std::uint8_t *recv_buf_ = nullptr;
+    std::size_t recv_buf_size_ = 0;
+    std::size_t recv_buf_capacity_ = 0;
+
+    TcpListener *listener_ = nullptr;
+    EventLoop *loop_ = nullptr;
+};
+
+class TcpListener : public EpollBase {
+public:
+    using on_connect_t = std::function<void(TcpListener &listener)>;
+
+    TcpListener(std::string host, std::uint16_t port, on_connect_t on_conn);
     ~TcpListener();
 
-    int getFD() { return fd_; }
-    std::optional<int> accept();
-    void closeClient(int client);
+    EpollType get_type() const override { return EpollType::Listener; }
+    int fd() const { return fd_; }
+    void on_conn() { on_conn_(*this); }
 
-    std::function<void(EventLoop &loop, TcpListener &listener)> on_connect;
-    std::function<void(EventLoop &loop, Ctx &ctx)> on_readable;
-    std::function<void(EventLoop &loop, Ctx &ctx)> on_writeable;
+    Client *accept(void);
+
+    EventLoop *loop; /**< @brief Points to the event loop */
 
 private:
     std::string host_;
     uint16_t port_;
     int fd_;
+    on_connect_t on_conn_;
 };
 
+/**
+ * @brief The main class, handling the event loop.
+ */
 class EventLoop {
 public:
     EventLoop();
-    int run();
-    void attatchListener(TcpListener &listener);
+    ~EventLoop();
 
-    void watch(int client, TcpListener &listener, void *data);
-    void unwatch(int client);
+    void run();
+
+    void attach(TcpListener &listener);
+    Client *create_client(int fd, TcpListener *listener) {
+        Client client(fd, listener, this);
+        ListNode<Client> *node = clients_.push_back(std::move(client));
+        node->val.node = node;
+        return &node->val;
+    }
+
+    // void watch(int client, TcpListener &listener, void *data);
+    // void unwatch(int client);
 
 private:
-    void pollIO(int timeout);
+    void poll_io(int timeout);
 
     bool is_running_ = false;
     int epollfd_ = -1;
-};
 
-void displayVersion();
+    List<TcpListener &> listeners_;
+    List<Client> clients_;
+};
 
 } // namespace wolf
 
