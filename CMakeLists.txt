@@ -4,8 +4,9 @@ project(wolf VERSION 0.0.1 LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_FLAGS -g)
 
-add_library(${PROJECT_NAME} src/wolf.cpp src/list.cpp)
+add_library(${PROJECT_NAME} src/wolf.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC include)
 
 # test

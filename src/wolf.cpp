@@ -1,185 +1,218 @@
-#include <asm-generic/socket.h>
 #include <cerrno>
+#include <cstring>
 #include <format>
 #include <iostream>
-#include <optional>
+#include <string>
 
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <fcntl.h>
 
+#include <list.h>
+#include <unistd.h>
 #include <wolf.h>
 
 namespace wolf {
 
-/// TcpListener
+/// Client
+Client::Client() {}
 
-/// Creates a socket and tries to start listening
-/// The socket is marked as nonblocking
-TcpListener::TcpListener(std::string host, uint16_t port)
-    : host_(host), port_(port) {
+Client::Client(int fd, TcpListener *listener, EventLoop *loop)
+    : fd_(fd), listener_(listener), loop_(loop) {}
+
+Client::~Client() {}
+
+/**
+ * @brief Creates a listening socket
+ *
+ * Creates a socket listening on host:port. Does not start
+ * accepting connections until attached to the event loop.
+ * After being attached to the loop, when there is an
+ * incomming connection, the callback on_conn is called.
+ *
+ * @throws ListenerException
+ */
+TcpListener::TcpListener(std::string host, std::uint16_t port,
+                         on_connect_t on_conn)
+    : host_(host), port_(port), on_conn_(on_conn) {
     fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd_ < 0) {
-        // handle error
-        std::cout << "socket err\n";
+        std::string msg = "Failed to create socket, got error: ";
+        msg += strerror(errno);
+        throw ListenerException(msg);
     }
 
     int val = 1;
-    int err = setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (void*)&val, sizeof(val));
-    if (err != 0) {
-        // TODO handle error
+    int err =
+        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (void *)&val, sizeof(val));
+    if (err < 0) {
+        std::string msg = "Failed to set socket option REUSEADDR, got error: ";
+        msg += strerror(errno);
+        throw ListenerException(msg);
     }
 
     struct addrinfo *addrinfo;
-    err = getaddrinfo(host.c_str(), std::to_string(port).c_str(), NULL,
-                          &addrinfo);
+    struct addrinfo hints;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = 0;
+    err = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints,
+                      &addrinfo);
     if (err != 0) {
-        // handle error
-        std::cout << "getaddrinfo error\n";
+        std::string msg = "getaddrinfo failed with error: ";
+        msg += gai_strerror(err);
+        throw ListenerException(msg);
     }
 
     while (addrinfo) {
-        err = bind(fd_, addrinfo->ai_addr, sizeof(*addrinfo->ai_addr));
+        err = bind(fd_, addrinfo->ai_addr, addrinfo->ai_addrlen);
         if (err == 0)
             break;
         addrinfo = addrinfo->ai_next;
     }
 
     if (err < 0) {
-        // handle err
-        std::cout << "bind error\n";
+        std::string msg =
+            std::format("Listener failed to bind to {}:{}. Got error {}", host,
+                        port, strerror(errno));
+        throw ListenerException(msg);
     }
 
     err = listen(fd_, 200);
     if (err < 0) {
-        // handle error
-        std::cout << "listen error\n";
+        std::string msg = "Listener failed to listen, got error: ";
+        msg += strerror(errno);
+        throw ListenerException(msg);
     }
 
     freeaddrinfo(addrinfo);
-};
-
-/// Closes the socket
-TcpListener::~TcpListener() {
-    if (close(fd_) < 0) {
-        // handle error
-    }
 }
 
-std::optional<int> TcpListener::accept() {
-    int client = accept4(fd_, NULL, NULL, SOCK_NONBLOCK);
-    if (client < 0) {
-        // check if blocking
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return {};
+/**
+ * @brief Closes the associated file descriptor
+ */
+TcpListener::~TcpListener() { close(fd_); }
 
-        // TODO handle error
+/**
+ * @throws AcceptException
+ */
+Client *TcpListener::accept() {
+    struct sockaddr_storage addr;
+    socklen_t addr_len = 0;
+    int fd = accept4(fd_, (struct sockaddr *)&addr, &addr_len, SOCK_NONBLOCK);
+    if (fd < 0) {
+        if (errno & (EAGAIN | EWOULDBLOCK)) {
+            return nullptr;
+        }
+        std::string msg = "Failed to accept client, with error: ";
+        msg += strerror(errno);
+        throw AcceptException(msg);
+        // TODO make this better
     }
-    return client;
+
+    return loop->create_client(fd, this);
 }
 
-void TcpListener::closeClient(int client) {
-    if (close(client) < 0) {
-        // TODO handle error
-    }
-}
+/*************************************************
+ *                    Loop                        *
+ *************************************************/
 
-/// Event Loop
-
-/// Initialise epoll
+/**
+ * @brief Creates a new event loop.
+ * @throws EpollException
+ */
 EventLoop::EventLoop() {
-    epollfd_ = epoll_create1(0);
-    if (epollfd_ < 0) {
-        // handle error
+    if ((epollfd_ = epoll_create1(0)) < 0) {
+        std::string msg = "Epoll failed to create with error: ";
+        msg += strerror(errno);
+        throw EpollException(msg);
     }
 }
 
-void EventLoop::attatchListener(TcpListener &listener) {
-    struct epoll_event epoll_event;
+/**
+ * @brief Destroys the event loop.
+ */
+EventLoop::~EventLoop() {
+    close(epollfd_);
 
-    epoll_event.events = EPOLLIN | EPOLLOUT | EPOLLET;
-
-    Ctx *ctx = new Ctx(listener, listener.getFD(), true, nullptr);
-    epoll_event.data.ptr = ctx;
-
-    int err =
-        epoll_ctl(epollfd_, EPOLL_CTL_ADD, listener.getFD(), &epoll_event);
-    if (err < 0) {
-        // handle error
+    for (TcpListener &x : listeners_) {
+        x.loop = nullptr;
     }
 }
 
-/// Adds a client to a watchlist
-/// Allocates a Ctx struct which is managed internally
-/// data is managed by the caller
-void EventLoop::watch(int client, TcpListener &listener, void *data) {
-    Ctx *ctx = new Ctx(listener, client, false, data);
+/**
+ * @brief Runs the event loop until stopped.
+ *
+ * Blocks the thread, running in an infinite loop until
+ * stopped by a call to stop(), or by an exception being thrown.
+ */
+void EventLoop::run() {
+    is_running_ = true;
+    while (is_running_) {
+        poll_io(-1);
+    }
+}
+
+/**
+ * @brief Attach a listener to the event loop
+ *
+ * Attaches a listener to the event loop. The listener will start
+ * receiving connect events from the loop. The @ref TcpListener::loop "loop"
+ * field is set to this loop.
+ *
+ * @throws EpollException
+ */
+void EventLoop::attach(TcpListener &listener) {
+    listener.loop = this;
 
     struct epoll_event ev;
-    ev.data.ptr = ctx;
-    ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
-    if (epoll_ctl(epollfd_, EPOLL_CTL_ADD, client, &ev) < 0) {
-        // TODO handle error     
+    ev.data.ptr = &listener;
+    ev.events = EPOLLIN | EPOLLET;
+    if (epoll_ctl(epollfd_, EPOLL_CTL_ADD, listener.fd(), &ev)) {
+        std::string msg = "Failed to add listener, got error: ";
+        msg += strerror(errno);
+        throw EpollException(msg);
     }
+
+    listeners_.push_back(listener);
 }
 
-void EventLoop::unwatch(int client) {
-    if (epoll_ctl(epollfd_, EPOLL_CTL_DEL, client, nullptr) < 0) {
-        // TODO handle error
-    }
-}
-
-void EventLoop::pollIO(int timeout) {
-    struct epoll_event epoll_events[1024];
-    int nfds = epoll_wait(epollfd_, epoll_events, 1024, timeout);
+void EventLoop::poll_io(int timeout) {
+    constexpr int MAX_EVENTS = 1024;
+    struct epoll_event epoll_events[MAX_EVENTS];
+    int nfds = epoll_wait(epollfd_, epoll_events, MAX_EVENTS, timeout);
 
     for (epoll_event *ev = epoll_events; ev < epoll_events + nfds; ev++) {
-        Ctx *ctx = (Ctx *)ev->data.ptr;
+        wolf::EpollBase *base = static_cast<wolf::EpollBase *>(ev->data.ptr);
+        if (wolf::Client *client = dynamic_cast<wolf::Client *>(base)) {
 
-        if (ev->events & EPOLLRDHUP) {
-            unwatch(ctx->fd);
-            ctx->listener.closeClient(ctx->fd);
-            delete ctx;
-            std::cout << "holdup\n";
-        } else if (ev->events & EPOLLIN) {
-            if (ctx->is_listener) {
-                ctx->listener.on_connect(*this, ctx->listener);
-            } else {
-                ctx->listener.on_readable(*this, *ctx);
-            }
-            std::cout << "readable\n";
-        } else if (ev->events & EPOLLOUT) {
-            ctx->listener.on_writeable(*this, *ctx);
-            std::cout << "writeable\n";
         } else {
-            std::cout << "epoll unknown event\n";
+            wolf::TcpListener *listener =
+                static_cast<wolf::TcpListener *>(base);
+            listener->on_conn();
         }
+
+        // if (ev->events & EPOLLRDHUP) {
+        //     unwatch(ctx->fd);
+        //     ctx->listener.closeClient(ctx->fd);
+        //     delete ctx;
+        //     std::cout << "holdup\n";
+        // } else if (ev->events & EPOLLIN) {
+        //     if (ctx->is_listener) {
+        //         ctx->listener.on_connect(*this, ctx->listener);
+        //     } else {
+        //         ctx->listener.on_readable(*this, *ctx);
+        //     }
+        //     std::cout << "readable\n";
+        // } else if (ev->events & EPOLLOUT) {
+        //     ctx->listener.on_writeable(*this, *ctx);
+        //     std::cout << "writeable\n";
+        // } else {
+        //     std::cout << "epoll unknown event\n";
+        // }
     }
-}
-
-int EventLoop::run() {
-    is_running_ = true;
-    int timeout = -1;
-
-    // the event loop
-    while (is_running_) {
-        std::cout << "loop iter\n";
-        pollIO(timeout);
-    }
-
-    return 0;
-}
-
-// Misc
-void displayVersion() {
-    std::cout << "Wolf Version "
-              << std::format("{}.{}.{}", WOLF_MAJOR_VERSION, WOLF_MINOR_VERSION,
-                             WOLF_PATCH_VERSION)
-              << std::endl;
 }
 
 } // namespace wolf
