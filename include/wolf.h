@@ -2,11 +2,11 @@
 #define WOLF_H_INCLUDED
 
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
+#include <list>
 #include <string>
-
-#include <list.h>
 
 namespace wolf {
 
@@ -42,16 +42,19 @@ private:
     const std::string msg_;
 };
 
-enum class EpollType { Client, Listener };
 class EpollBase {
 public:
+    enum class EpollType { Client, Listener };
     virtual EpollType get_type() const = 0;
     // virtual ~EpollBase() = 0;
 };
 
 class Client : public EpollBase {
+    friend EventLoop;
+
 public:
-    using on_recv_t = std::function<void(Client &client)>;
+    using on_recv_t =
+        std::function<void(Client &client, std::vector<std::uint8_t> buffer)>;
 
     Client();
     Client(int fd, TcpListener *listener, EventLoop *loop);
@@ -64,23 +67,27 @@ public:
 
     void recv(on_recv_t on_recv);
     void stop_recv();
-    void clear_recv_buf();
-    const std::uint8_t *recv_buf() const { return recv_buf_; }
+    bool is_recv();
 
+    void send(const std::uint8_t *data, std::size_t size);
+    void send(std::vector<std::uint8_t> vec);
     void send(std::string msg);
     void clear_send_buf();
-
-    ListNode<Client> *node = nullptr;
 
 private:
     int fd_ = -1;
 
-    std::uint8_t *recv_buf_ = nullptr;
-    std::size_t recv_buf_size_ = 0;
-    std::size_t recv_buf_capacity_ = 0;
+    std::deque<std::vector<std::uint8_t>> send_buf_;
+    std::size_t send_buf_offset_ = 0;
 
     TcpListener *listener_ = nullptr;
     EventLoop *loop_ = nullptr;
+
+    on_recv_t on_recv_ = nullptr;
+
+    std::list<Client *>::iterator read_node_;
+    std::list<Client *>::iterator write_node_;
+    std::list<Client>::iterator loop_node_;
 };
 
 class TcpListener : public EpollBase {
@@ -116,24 +123,25 @@ public:
     void run();
 
     void attach(TcpListener &listener);
-    Client *create_client(int fd, TcpListener *listener) {
-        Client client(fd, listener, this);
-        ListNode<Client> *node = clients_.push_back(std::move(client));
-        node->val.node = node;
-        return &node->val;
-    }
-
-    // void watch(int client, TcpListener &listener, void *data);
-    // void unwatch(int client);
+    Client &create_client(int fd, TcpListener *listener);
 
 private:
     void poll_io(int timeout);
+    void run_read_events();
+    void run_write_events();
+
+    std::list<Client *>::iterator
+    read_list_remove(std::list<Client *>::iterator it);
+    void read_list_add(Client &client);
+    bool in_read_list(Client &client);
 
     bool is_running_ = false;
     int epollfd_ = -1;
 
-    List<TcpListener &> listeners_;
-    List<Client> clients_;
+    std::list<TcpListener *> listeners_;
+    std::list<Client> clients_;
+    std::list<Client *> read_queue_;
+    std::list<Client *> write_queue_;
 };
 
 } // namespace wolf

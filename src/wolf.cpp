@@ -1,8 +1,8 @@
 #include <cerrno>
 #include <cstring>
 #include <format>
-#include <iostream>
 #include <string>
+#include <iostream>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -10,19 +10,23 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <list.h>
 #include <unistd.h>
 #include <wolf.h>
 
 namespace wolf {
 
-/// Client
+constexpr int MAX_DATA = 65535;
+
+const std::list<Client *>::iterator EMPTY_CLIENT_ITER;
+
 Client::Client() {}
 
 Client::Client(int fd, TcpListener *listener, EventLoop *loop)
     : fd_(fd), listener_(listener), loop_(loop) {}
 
 Client::~Client() {}
+
+void Client::recv(on_recv_t on_recv) { on_recv_ = on_recv; }
 
 /**
  * @brief Creates a listening socket
@@ -48,21 +52,24 @@ TcpListener::TcpListener(std::string host, std::uint16_t port,
     int err =
         setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (void *)&val, sizeof(val));
     if (err < 0) {
+        close(fd_);
         std::string msg = "Failed to set socket option REUSEADDR, got error: ";
         msg += strerror(errno);
         throw ListenerException(msg);
     }
 
-    struct addrinfo *addrinfo;
+    struct addrinfo *addrinfo = nullptr;
     struct addrinfo hints;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = 0;
+    hints.ai_flags = AI_PASSIVE;
     err = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints,
                       &addrinfo);
     if (err != 0) {
+        close(fd_);
         std::string msg = "getaddrinfo failed with error: ";
         msg += gai_strerror(err);
+        freeaddrinfo(addrinfo);
         throw ListenerException(msg);
     }
 
@@ -73,7 +80,10 @@ TcpListener::TcpListener(std::string host, std::uint16_t port,
         addrinfo = addrinfo->ai_next;
     }
 
+    freeaddrinfo(addrinfo);
+
     if (err < 0) {
+        close(fd_);
         std::string msg =
             std::format("Listener failed to bind to {}:{}. Got error {}", host,
                         port, strerror(errno));
@@ -82,12 +92,11 @@ TcpListener::TcpListener(std::string host, std::uint16_t port,
 
     err = listen(fd_, 200);
     if (err < 0) {
+        close(fd_);
         std::string msg = "Listener failed to listen, got error: ";
         msg += strerror(errno);
         throw ListenerException(msg);
     }
-
-    freeaddrinfo(addrinfo);
 }
 
 /**
@@ -103,7 +112,7 @@ Client *TcpListener::accept() {
     socklen_t addr_len = 0;
     int fd = accept4(fd_, (struct sockaddr *)&addr, &addr_len, SOCK_NONBLOCK);
     if (fd < 0) {
-        if (errno & (EAGAIN | EWOULDBLOCK)) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return nullptr;
         }
         std::string msg = "Failed to accept client, with error: ";
@@ -112,7 +121,7 @@ Client *TcpListener::accept() {
         // TODO make this better
     }
 
-    return loop->create_client(fd, this);
+    return &loop->create_client(fd, this);
 }
 
 /*************************************************
@@ -137,8 +146,8 @@ EventLoop::EventLoop() {
 EventLoop::~EventLoop() {
     close(epollfd_);
 
-    for (TcpListener &x : listeners_) {
-        x.loop = nullptr;
+    for (TcpListener *x : listeners_) {
+        x->loop = nullptr;
     }
 }
 
@@ -150,8 +159,16 @@ EventLoop::~EventLoop() {
  */
 void EventLoop::run() {
     is_running_ = true;
+    int timeout = -1;
     while (is_running_) {
-        poll_io(-1);
+        if (read_queue_.size())
+            timeout = 0;
+        else
+            timeout = -1;
+
+        poll_io(timeout);
+        run_read_events();
+        run_write_events();
     }
 }
 
@@ -176,43 +193,126 @@ void EventLoop::attach(TcpListener &listener) {
         throw EpollException(msg);
     }
 
-    listeners_.push_back(listener);
+    listeners_.push_back(&listener);
 }
 
+/**
+ * @brief Creates and stores a client object, registering it for events.
+ */
+Client &EventLoop::create_client(int fd, TcpListener *listener) {
+    Client &client = clients_.emplace_back(fd, listener, this);
+    client.loop_node_ = std::prev(clients_.end());
+    read_list_add(client);
+
+    // register in epoll
+    // TODO
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLEXCLUSIVE | EPOLLET;
+    ev.data.ptr = &client;
+    epoll_ctl(epollfd_, EPOLL_CTL_ADD, client.fd(), &ev);
+
+    return client;
+}
+
+/**
+ * @brief Polls for IO, giving up after @param timeout seconds.
+ */
 void EventLoop::poll_io(int timeout) {
     constexpr int MAX_EVENTS = 1024;
     struct epoll_event epoll_events[MAX_EVENTS];
     int nfds = epoll_wait(epollfd_, epoll_events, MAX_EVENTS, timeout);
 
     for (epoll_event *ev = epoll_events; ev < epoll_events + nfds; ev++) {
-        wolf::EpollBase *base = static_cast<wolf::EpollBase *>(ev->data.ptr);
-        if (wolf::Client *client = dynamic_cast<wolf::Client *>(base)) {
+        EpollBase *base = static_cast<EpollBase *>(ev->data.ptr);
 
-        } else {
-            wolf::TcpListener *listener =
-                static_cast<wolf::TcpListener *>(base);
-            listener->on_conn();
+        switch (base->get_type()) {
+        case EpollBase::EpollType::Client: {
+            Client *client = static_cast<Client *>(base);
+
+            if (ev->events & EPOLLRDHUP) {
+                throw EpollException("CONNECTION CLOSED NOT IMPLEMENTED");
+            }
+
+            if (ev->events & EPOLLIN) {
+                // client becomes readable, add to read queue
+                if (!in_read_list(*client)) {
+                    read_list_add(*client);
+                }
+            }
+
+            if (ev->events & EPOLLOUT) {
+            }
+
+            break;
         }
+        case EpollBase::EpollType::Listener: {
+            TcpListener *listener = static_cast<TcpListener *>(base);
 
-        // if (ev->events & EPOLLRDHUP) {
-        //     unwatch(ctx->fd);
-        //     ctx->listener.closeClient(ctx->fd);
-        //     delete ctx;
-        //     std::cout << "holdup\n";
-        // } else if (ev->events & EPOLLIN) {
-        //     if (ctx->is_listener) {
-        //         ctx->listener.on_connect(*this, ctx->listener);
-        //     } else {
-        //         ctx->listener.on_readable(*this, *ctx);
-        //     }
-        //     std::cout << "readable\n";
-        // } else if (ev->events & EPOLLOUT) {
-        //     ctx->listener.on_writeable(*this, *ctx);
-        //     std::cout << "writeable\n";
-        // } else {
-        //     std::cout << "epoll unknown event\n";
-        // }
+            listener->on_conn();
+            break;
+        }
+        }
     }
+}
+
+/**
+ * @brief Attempts to read some data from each Client in the read list.
+ *
+ * If a client is not readable, it is removed from the list. This is also
+ * where we detect client disconnection.
+ */
+void EventLoop::run_read_events() {
+    auto it = read_queue_.begin();
+    while (it != read_queue_.end()) {
+        Client &client = *(*it);
+
+        // read upto 65535 bytes
+        std::vector<std::uint8_t> buffer(MAX_DATA);
+        int n = recv(client.fd(), buffer.data(), MAX_DATA, 0);
+        if (n == -1) {
+            // check ewouldblock otherwise throw
+            // if would block, notify
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                it = read_list_remove(it);
+            } else {
+                ++it;
+                throw EpollException("READ EVENT ERROR OTHER THAN BLOCK");
+            }
+        } else if (n == 0) {
+            // client disconnected
+            ++it;
+            throw EpollException("CLIENT DISCONNECTED NOT HANDLED");
+        } else if (n < MAX_DATA) {
+            // done read, remove and notify
+            buffer.resize(n);
+            client.on_recv_(client, std::move(buffer));
+            it = read_list_remove(it);
+        } else {
+            // n == MAX_READ
+            // more data avaible, keep in queue
+            buffer.resize(n);
+            client.on_recv_(client, std::move(buffer));
+            ++it;
+        }
+    }
+}
+
+void EventLoop::run_write_events() {}
+
+void EventLoop::read_list_add(Client &client) {
+    read_queue_.push_back(&client);
+    client.read_node_ = std::prev(read_queue_.end());
+}
+
+std::list<Client *>::iterator
+EventLoop::read_list_remove(std::list<Client *>::iterator it) {
+    Client *client = *it;
+    client->read_node_ = EMPTY_CLIENT_ITER;
+    return read_queue_.erase(it);
+}
+
+bool EventLoop::in_read_list(Client &client) {
+    return client.read_node_ != EMPTY_CLIENT_ITER;
 }
 
 } // namespace wolf

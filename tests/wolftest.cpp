@@ -1,33 +1,30 @@
-#include <string>
+#include <format>
 #include <iostream>
+#include <string>
+#include <vector>
 
 #include <wolf.h>
 
-// testing
-#include <sys/socket.h>
-#include <unistd.h>
-
 // fake http example
-// enum class HttpResult { ERROR, INCOMPLETE, COMPLETE };
+enum class HttpResult { ERROR, INCOMPLETE, COMPLETE };
 
-// HttpResult parse_http(const std::uint8_t *buf, size_t &offt) {
-//     offt = 10;
-//     return HttpResult::COMPLETE;
-// }
+HttpResult parse_http(const std::vector<std::uint8_t> &buffer, size_t &offt) {
+    offt = 10;
+    return HttpResult::COMPLETE;
+}
 
-// void on_recv(wolf::Client &client) {
+// void on_recv(wolf::Client &client, std::vector<std::uint8_t> buffer) {
 //     size_t offt = 0;
-//     HttpResult result = parse_http(client.recv_buf(), offt);
+//     HttpResult result = parse_http(buffer, offt);
 //     switch (result) {
 //     case HttpResult::COMPLETE:
 //     {
-//         // std::string data = "HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\ncall me if they die";
-//         std::string data = "HTTP/1.1 200 OK\r\nContent-Length: ";
-//         std::string content = "fuck you bitch cunt";
+//         // std::string data = "HTTP/1.1 200 OK\r\nContent-Length:
+//         19\r\n\r\ncall me if they die"; std::string data = "HTTP/1.1 200
+//         OK\r\nContent-Length: "; std::string content = "fuck you bitch cunt";
 //         data.append(std::to_string(content.size()) + "\r\n\r\n");
 //         data.append(content);
-//         client.send(std::move(data));
-//         // client.recv_buf_shift_down(offt);
+//         client.send(data);
 //         break;
 //     }
 //     case HttpResult::ERROR:
@@ -38,24 +35,35 @@
 //     }
 // }
 
-void on_connect(wolf::TcpListener &listener) {
-    std::cout << "on_connect called\n";
+int recv_count = 0;
+void on_recv(wolf::Client &client, std::vector<std::uint8_t> buffer) {
+    std::cout << std::format("on_recv called. fd: {} bufsize: {}\n",
+                             client.fd(), buffer.size());
 
-    wolf::Client *client = listener.accept();
-    if (!client) {
-        return;
+    // for (auto x : buffer) {
+    //     std::cout << (char)x;
+    // }
+    recv_count++;
+    std::cout << "recv_count: " << recv_count << std::endl;
+}
+
+int connection_count = 0;
+void on_connect(wolf::TcpListener &listener) {
+    // std::cout << "on_connect called\n";
+    while (wolf::Client *client = listener.accept()) {
+        connection_count++;
+        client->recv(on_recv);
     }
 
-    // client->recv(on_recv);
+    std::cout << std::format("connection: {}", connection_count) << '\n';
 }
 
 int main(void) {
     wolf::EventLoop loop;
     wolf::TcpListener listener("localhost", 4444, on_connect);
-    
+
     loop.attach(listener);
     loop.run();
-
 
     return 0;
 }
