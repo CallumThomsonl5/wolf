@@ -1,8 +1,10 @@
+#include <algorithm>
+#include <cassert>
 #include <cerrno>
 #include <cstring>
 #include <format>
-#include <string>
 #include <iostream>
+#include <string>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -15,7 +17,7 @@
 
 namespace wolf {
 
-constexpr int MAX_DATA = 65535;
+constexpr std::size_t MAX_DATA = 65535;
 
 const std::list<Client *>::iterator EMPTY_CLIENT_ITER;
 
@@ -27,6 +29,11 @@ Client::Client(int fd, TcpListener *listener, EventLoop *loop)
 Client::~Client() {}
 
 void Client::recv(on_recv_t on_recv) { on_recv_ = on_recv; }
+
+void Client::send(std::vector<std::uint8_t> vec) {
+    send_buf_.push_back(std::move(vec));
+    loop_->write_list_add(*this);
+}
 
 /**
  * @brief Creates a listening socket
@@ -60,6 +67,7 @@ TcpListener::TcpListener(std::string host, std::uint16_t port,
 
     struct addrinfo *addrinfo = nullptr;
     struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
@@ -90,7 +98,7 @@ TcpListener::TcpListener(std::string host, std::uint16_t port,
         throw ListenerException(msg);
     }
 
-    err = listen(fd_, 200);
+    err = listen(fd_, 65535);
     if (err < 0) {
         close(fd_);
         std::string msg = "Listener failed to listen, got error: ";
@@ -161,7 +169,7 @@ void EventLoop::run() {
     is_running_ = true;
     int timeout = -1;
     while (is_running_) {
-        if (read_queue_.size())
+        if (read_queue_.size() || write_queue_.size())
             timeout = 0;
         else
             timeout = -1;
@@ -241,6 +249,9 @@ void EventLoop::poll_io(int timeout) {
             }
 
             if (ev->events & EPOLLOUT) {
+                if (client->send_buf_.size() && !in_write_list(*client)) {
+                    write_list_add(*client);
+                }
             }
 
             break;
@@ -276,12 +287,15 @@ void EventLoop::run_read_events() {
                 it = read_list_remove(it);
             } else {
                 ++it;
-                throw EpollException("READ EVENT ERROR OTHER THAN BLOCK");
+                throw EpollException(
+                    std::format("Read error: {}", strerror(errno)));
             }
         } else if (n == 0) {
             // client disconnected
-            ++it;
-            throw EpollException("CLIENT DISCONNECTED NOT HANDLED");
+            // TODO
+            it = read_list_remove(it);
+            // ++it;
+            // throw EpollException("CLIENT DISCONNECTED NOT HANDLED");
         } else if (n < MAX_DATA) {
             // done read, remove and notify
             buffer.resize(n);
@@ -297,7 +311,55 @@ void EventLoop::run_read_events() {
     }
 }
 
-void EventLoop::run_write_events() {}
+void EventLoop::run_write_events() {
+    auto it = write_queue_.begin();
+    while (it != write_queue_.end()) {
+        Client &client = *(*it);
+
+        bool remove_flag = false;
+        std::size_t total = 0;
+        while (total < MAX_DATA && !client.send_buf_.empty()) {
+            std::vector<std::uint8_t> &buffer = client.send_buf_.front();
+            std::size_t send_size = std::min(
+                buffer.size() - client.send_buf_offset_, MAX_DATA - total);
+            ssize_t sent =
+                send(client.fd(), buffer.data() + client.send_buf_offset_,
+                     send_size, 0);
+
+            if (sent == -1) {
+                if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                    // BLOCKING REMOVE
+                    remove_flag = true;
+                    break;
+                } else {
+                    throw EpollException("WRITE UNKNOWN ERROR");
+                }
+            }
+
+            total += sent;
+
+            if (sent == buffer.size() - client.send_buf_offset_) {
+                // full amount sent, move to next buffer
+                client.send_buf_.pop_front();
+                client.send_buf_offset_ = 0;
+            } else {
+                client.send_buf_offset_ += sent;
+            }
+
+            if (sent < send_size) {
+                // blocking, remove
+                remove_flag = true;
+                break;
+            }
+        }
+
+        if (remove_flag || client.send_buf_.empty()) {
+            it = write_list_remove(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 void EventLoop::read_list_add(Client &client) {
     read_queue_.push_back(&client);
@@ -313,6 +375,22 @@ EventLoop::read_list_remove(std::list<Client *>::iterator it) {
 
 bool EventLoop::in_read_list(Client &client) {
     return client.read_node_ != EMPTY_CLIENT_ITER;
+}
+
+void EventLoop::write_list_add(Client &client) {
+    write_queue_.push_back(&client);
+    client.write_node_ = std::prev(write_queue_.end());
+}
+
+std::list<Client *>::iterator
+EventLoop::write_list_remove(std::list<Client *>::iterator it) {
+    Client *client = *it;
+    client->write_node_ = EMPTY_CLIENT_ITER;
+    return write_queue_.erase(it);
+}
+
+bool EventLoop::in_write_list(Client &client) {
+    return client.write_node_ != EMPTY_CLIENT_ITER;
 }
 
 } // namespace wolf

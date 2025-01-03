@@ -74,6 +74,8 @@ public:
     void send(std::string msg);
     void clear_send_buf();
 
+    EventLoop &loop() const { return *loop_; }
+
 private:
     int fd_ = -1;
 
@@ -125,15 +127,20 @@ public:
     void attach(TcpListener &listener);
     Client &create_client(int fd, TcpListener *listener);
 
-private:
-    void poll_io(int timeout);
-    void run_read_events();
-    void run_write_events();
-
     std::list<Client *>::iterator
     read_list_remove(std::list<Client *>::iterator it);
     void read_list_add(Client &client);
     bool in_read_list(Client &client);
+
+    void write_list_add(Client &client);
+    std::list<Client *>::iterator
+    write_list_remove(std::list<Client *>::iterator it);
+    bool in_write_list(Client &client);
+
+private:
+    void poll_io(int timeout);
+    void run_read_events();
+    void run_write_events();
 
     bool is_running_ = false;
     int epollfd_ = -1;

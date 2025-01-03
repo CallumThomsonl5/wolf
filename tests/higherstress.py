@@ -3,35 +3,46 @@ import time
 import multiprocessing
 import threading
 
-# def send_some_data(barrier):
-#     global count
-#     s = socket.socket()
-#     s.connect(("localhost", 4444))
+base = "127.0.0."
+def get_addr():
+    n = 0
+    while True:
+        n += 1
+        if (n == 7):
+            n = 1
+        yield base + str(n)
 
-#     barrier.wait()
-
-#     # s.send(b"FUCK YOU")
-
-#     time.sleep(100000)
-
-def make_connections(barrier, N):
+def make_connections(N, host):
     connections = []
     for _ in range(N):
         s = socket.socket()
-        s.connect(("localhost", 4444))
+        s.connect((host, 4444))
         connections.append(s)
-    # barrier.wait()
-
+    
     for c in connections: 
-        c.send(b"A"*65536 * 4)
+        c.send(b"A"*16384)
 
-    time.sleep(100000)
-
+    expecting = 16384
+    for c in connections:
+        got = 0
+        while got < expecting:
+            msg = c.recv(expecting - got)
+            got += len(msg)
+    
 T = 12
 N = T * 1000
-barrier = multiprocessing.Barrier(T)
 
 print(N)
+procs = []
+addr = get_addr()
 for i in range(T):
-    multiprocessing.Process(target=make_connections, args=[barrier, int(N/T)]).start()
+    p = multiprocessing.Process(target=make_connections, args=[int(N/T), next(addr)])
+    p.start()
+    procs.append(p)
 
+start = time.time()
+
+for p in procs:
+    p.join()
+
+print("ended", time.time() - start)

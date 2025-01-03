@@ -1,6 +1,7 @@
 #include <format>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <wolf.h>
@@ -37,32 +38,45 @@ HttpResult parse_http(const std::vector<std::uint8_t> &buffer, size_t &offt) {
 
 int recv_count = 0;
 void on_recv(wolf::Client &client, std::vector<std::uint8_t> buffer) {
-    std::cout << std::format("on_recv called. fd: {} bufsize: {}\n",
-                             client.fd(), buffer.size());
+    // std::cout << std::format("on_recv called. fd: {} bufsize: {}\n",
+    //                          client.fd(), buffer.size());
 
     // for (auto x : buffer) {
     //     std::cout << (char)x;
     // }
-    recv_count++;
-    std::cout << "recv_count: " << recv_count << std::endl;
+    // recv_count++;
+    // std::cout << "recv_count: " << recv_count << std::endl;
 }
 
-int connection_count = 0;
+// int connection_count = 0;
 void on_connect(wolf::TcpListener &listener) {
     // std::cout << "on_connect called\n";
     while (wolf::Client *client = listener.accept()) {
-        connection_count++;
+        // connection_count++;
         client->recv(on_recv);
+
+        std::vector<std::uint8_t> buffer(16384, 'A');
+        client->send(std::move(buffer));
     }
 
-    std::cout << std::format("connection: {}", connection_count) << '\n';
+    // std::cout << std::format("connection: {}", connection_count) << '\n';
 }
 
 int main(void) {
     wolf::EventLoop loop;
-    wolf::TcpListener listener("localhost", 4444, on_connect);
+    wolf::TcpListener listener("127.0.0.1", 4444, on_connect);
+    wolf::TcpListener listener2("127.0.0.2", 4444, on_connect);
+    wolf::TcpListener listener3("127.0.0.3", 4444, on_connect);
+    wolf::TcpListener listener4("127.0.0.4", 4444, on_connect);
+    wolf::TcpListener listener5("127.0.0.5", 4444, on_connect);
+    wolf::TcpListener listener6("127.0.0.6", 4444, on_connect);
 
     loop.attach(listener);
+    loop.attach(listener2);
+    loop.attach(listener3);
+    loop.attach(listener4);
+    loop.attach(listener5);
+    loop.attach(listener6);
     loop.run();
 
     return 0;
