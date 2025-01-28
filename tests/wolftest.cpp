@@ -22,7 +22,7 @@ HttpResult parse_http(const std::vector<std::uint8_t> &buffer, size_t &offt) {
 //     {
 //         // std::string data = "HTTP/1.1 200 OK\r\nContent-Length:
 //         19\r\n\r\ncall me if they die"; std::string data = "HTTP/1.1 200
-//         OK\r\nContent-Length: "; std::string content = "fuck you bitch cunt";
+//         OK\r\nContent-Length: "; std::string content = "hello world";
 //         data.append(std::to_string(content.size()) + "\r\n\r\n");
 //         data.append(content);
 //         client.send(data);
