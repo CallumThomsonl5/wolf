@@ -1,15 +1,29 @@
 #ifndef WOLF_IOURING_H_INCLUDED
 #define WOLF_IOURING_H_INCLUDED
 
+#include <atomic>
+#include <bit>
 #include <cstdint>
 #include <exception>
-#include <stack>
 #include <string>
 
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+template <typename T>
+static inline T load_acquire(const T *ptr) {
+    return std::atomic_load_explicit(
+        reinterpret_cast<const std::atomic<T> *>(ptr),
+        std::memory_order::acquire);
+}
+
+template <typename T>
+static inline void store_release(T *ptr, T value) {
+    std::atomic_store_explicit(reinterpret_cast<std::atomic<T> *>(ptr), value,
+                               std::memory_order::release);
+}
 
 class IOUringException : public std::exception {
 public:
@@ -29,13 +43,18 @@ public:
 
     void enter(int timeout);
 
-    bool sq_full();
-    int sq_space();
-    bool cq_full();
-    int cq_space();
+    bool sq_full() const;
+    void sq_push(io_uring_sqe sqe);
+    template <typename Addr, typename UserData>
+        requires(sizeof(UserData) == 8 && sizeof(Addr) == 8)
+    void sq_push(std::uint8_t opcode, int fd, std::uint64_t off, Addr addr,
+                 std::size_t len, UserData user_data);
+    void sq_start_push();
+    void sq_end_push();
 
-    void sq_push();
-    void cq_pop();
+    io_uring_cqe *cq_pop();
+    void cq_start_pop();
+    void cq_end_pop();
 
 private:
     int fd_ = -1;
@@ -45,21 +64,22 @@ private:
     std::uint32_t cq_size_ = 0;
 
     std::size_t sq_ptr_size_ = 0;
-    volatile void *sq_ptr_ = nullptr;
-    volatile std::uint32_t *sq_head_ = nullptr;
-    volatile std::uint32_t *sq_tail_ = nullptr;
+    void *sq_ptr_ = nullptr;
+    std::uint32_t *sq_head_ = nullptr;
+    std::uint32_t *sq_tail_ = nullptr;
+    std::uint32_t sq_new_tail_ = 0;
     std::uint32_t sq_mask_ = 0;
-    volatile std::uint32_t *sq_array_ = nullptr;
-    std::size_t sq_entries_size_ = 0;
-    volatile io_uring_sqe *sq_entries_ = nullptr;
-    std::stack<std::uint32_t> sq_free_list_;
+    std::uint32_t *sq_array_ = nullptr;
+    std::size_t sq_sqes_size_ = 0;
+    io_uring_sqe *sq_sqes_ = nullptr;
 
     std::size_t cq_ptr_size_ = 0;
-    volatile void *cq_ptr_ = nullptr;
-    volatile std::uint32_t *cq_head_ = nullptr;
-    volatile std::uint32_t *cq_tail_ = nullptr;
+    void *cq_ptr_ = nullptr;
+    std::uint32_t *cq_head_ = nullptr;
+    std::uint32_t cq_new_head_ = 0;
+    std::uint32_t *cq_tail_ = nullptr;
     std::uint32_t cq_mask_ = 0;
-    volatile io_uring_cqe *cq_array_ = nullptr;
+    io_uring_cqe *cq_array_ = nullptr;
 };
 
 inline IOUring::IOUring(std::uint32_t entries) {
@@ -78,10 +98,6 @@ inline IOUring::IOUring(std::uint32_t entries) {
     sq_size_ = params.sq_entries;
     cq_size_ = params.cq_entries;
 
-    for (int i = 0; i < sq_size_; i++) {
-        sq_free_list_.push(i);
-    }
-
     sq_ptr_size_ = params.sq_off.array + sq_size_ * sizeof(std::uint32_t);
     sq_ptr_ = mmap(0, sq_ptr_size_, PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
@@ -95,11 +111,11 @@ inline IOUring::IOUring(std::uint32_t entries) {
     sq_array_ =
         (std::uint32_t *)((std::uint8_t *)sq_ptr_ + params.sq_off.array);
 
-    sq_entries_size_ = sq_size_ * sizeof(struct io_uring_sqe);
-    sq_entries_ =
-        (io_uring_sqe *)mmap(0, sq_entries_size_, PROT_READ | PROT_WRITE,
+    sq_sqes_size_ = sq_size_ * sizeof(struct io_uring_sqe);
+    sq_sqes_ =
+        (io_uring_sqe *)mmap(0, sq_sqes_size_, PROT_READ | PROT_WRITE,
                              MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
-    if (sq_entries_ == MAP_FAILED) {
+    if (sq_sqes_ == MAP_FAILED) {
         throw IOUringException("mmap: failed to mmap sqentries");
     }
 
@@ -119,7 +135,7 @@ inline IOUring::IOUring(std::uint32_t entries) {
 inline IOUring::~IOUring() {
     if (fd_ >= 0) {
         munmap((void *)sq_ptr_, sq_ptr_size_);
-        munmap((void *)sq_entries_, sq_entries_size_);
+        munmap((void *)sq_sqes_, sq_sqes_size_);
         munmap((void *)cq_ptr_, cq_ptr_size_);
         close(fd_);
     }
@@ -129,5 +145,50 @@ inline void IOUring::enter(int timeout) {
     syscall(SYS_io_uring_enter, fd_, to_submit_, 0, 0, 0);
     to_submit_ = 0;
 }
+
+inline bool IOUring::sq_full() const {
+    return sq_new_tail_ - load_acquire(sq_head_) >= sq_size_;
+}
+
+inline void IOUring::sq_push(io_uring_sqe sqe) {
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = sqe;
+    sq_array_[index] = index;
+    to_submit_++;
+}
+
+template <typename Addr, typename UserData>
+    requires(sizeof(UserData) == 8 && sizeof(Addr) == 8)
+inline void IOUring::sq_push(std::uint8_t opcode, int fd, std::uint64_t off,
+                             Addr addr, std::size_t len, UserData user_data) {
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+
+    sq_sqes_[index].opcode = opcode;
+    sq_sqes_[index].fd = fd;
+    sq_sqes_[index].off = off;
+    sq_sqes_[index].addr = std::bit_cast<std::uint64_t>(addr);
+    sq_sqes_[index].len = len;
+    sq_sqes_[index].user_data = std::bit_cast<std::uint64_t>(user_data);
+
+    sq_array_[index] = index;
+}
+
+inline void IOUring::sq_start_push() { sq_new_tail_ = load_acquire(sq_tail_); }
+
+inline void IOUring::sq_end_push() { store_release(sq_tail_, sq_new_tail_); }
+
+inline io_uring_cqe *IOUring::cq_pop() {
+    // CQ is empty
+    // Barrier to make sure that cq_save_head_ is updated prior to load
+    // of tail
+    if (cq_new_head_ == load_acquire(cq_tail_)) {
+        return nullptr;
+    }
+    return &cq_array_[cq_new_head_++ & cq_mask_];
+}
+
+inline void IOUring::cq_start_pop() { cq_new_head_ = load_acquire(cq_head_); }
+
+inline void IOUring::cq_end_pop() { store_release(cq_head_, cq_new_head_); }
 
 #endif // WOLF_IOURING_H_INCLUDED
