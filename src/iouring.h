@@ -8,6 +8,7 @@
 #include <string>
 
 #include <linux/io_uring.h>
+#include <linux/time_types.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -25,6 +26,9 @@ static inline void store_release(T *ptr, T value) {
                                std::memory_order::release);
 }
 
+/**
+ * @brief Indicates error with iouring
+ */
 class IOUringException : public std::exception {
 public:
     IOUringException(const std::string &msg) : msg_(msg) {}
@@ -34,6 +38,9 @@ private:
     const std::string msg_;
 };
 
+/**
+ * @brief A wrapper over the io_uring interface with a simplified API and RAII.
+ */
 class IOUring {
 public:
     IOUring(std::uint32_t entries);
@@ -48,7 +55,7 @@ public:
     template <typename Addr, typename UserData>
         requires(sizeof(UserData) == 8 && sizeof(Addr) == 8)
     void sq_push(std::uint8_t opcode, int fd, std::uint64_t off, Addr addr,
-                 std::size_t len, UserData user_data);
+                 std::size_t len, std::uint8_t flags, UserData user_data);
     void sq_start_push();
     void sq_end_push();
 
@@ -82,6 +89,11 @@ private:
     io_uring_cqe *cq_array_ = nullptr;
 };
 
+/**
+ * @brief Attempts to setup iouring.
+ *
+ * @throws IOUringException if there is an error setting up the ring.
+ */
 inline IOUring::IOUring(std::uint32_t entries) {
     struct io_uring_params params{
         .sq_entries = 0,
@@ -141,15 +153,38 @@ inline IOUring::~IOUring() {
     }
 }
 
+/**
+ * @brief Attempts to submit SQs and waits for the completion of at least one
+ * CQE, or timeout seconds.
+ *
+ * @param timeout Maximum time in seconds to block before returning.
+ */
 inline void IOUring::enter(int timeout) {
-    syscall(SYS_io_uring_enter, fd_, to_submit_, 0, 0, 0);
+    // Kernel >= 5.11
+    __kernel_timespec ts{.tv_sec = timeout};
+    io_uring_getevents_arg arg{.ts = std::bit_cast<std::uint64_t>(&ts)};
+    syscall(SYS_io_uring_enter, fd_, to_submit_, 1,
+            IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
+            std::bit_cast<std::uint64_t>(&arg), sizeof(arg));
+
     to_submit_ = 0;
 }
 
+/**
+ * @brief Checks if the SQ is full.
+ *
+ * Must be used in the context of @ref sq_start_push().
+ */
 inline bool IOUring::sq_full() const {
     return sq_new_tail_ - load_acquire(sq_head_) >= sq_size_;
 }
 
+/**
+ * @brief Pushes SQE onto the SQ.
+ *
+ * Prior to a series of sq_push(), @ref sq_start_push() must be called. After a
+ * series of sq_push() calls, @ref sq_end_push() must be called.
+ */
 inline void IOUring::sq_push(io_uring_sqe sqe) {
     std::uint32_t index = sq_new_tail_++ & sq_mask_;
     sq_sqes_[index] = sqe;
@@ -157,10 +192,16 @@ inline void IOUring::sq_push(io_uring_sqe sqe) {
     to_submit_++;
 }
 
+/**
+ * @brief Similar to @ref sq_push() but initialises the entry in place.
+ *
+ * @see sq_push() for more details.
+ */
 template <typename Addr, typename UserData>
     requires(sizeof(UserData) == 8 && sizeof(Addr) == 8)
 inline void IOUring::sq_push(std::uint8_t opcode, int fd, std::uint64_t off,
-                             Addr addr, std::size_t len, UserData user_data) {
+                             Addr addr, std::size_t len, std::uint8_t flags,
+                             UserData user_data) {
     std::uint32_t index = sq_new_tail_++ & sq_mask_;
 
     sq_sqes_[index].opcode = opcode;
@@ -168,15 +209,35 @@ inline void IOUring::sq_push(std::uint8_t opcode, int fd, std::uint64_t off,
     sq_sqes_[index].off = off;
     sq_sqes_[index].addr = std::bit_cast<std::uint64_t>(addr);
     sq_sqes_[index].len = len;
+    sq_sqes_[index].flags = flags;
     sq_sqes_[index].user_data = std::bit_cast<std::uint64_t>(user_data);
 
     sq_array_[index] = index;
 }
 
+/**
+ * @brief Initialises pushing SQEs to the SQ.
+ *
+ * Must be called prior to a series of @ref sq_push().
+ */
 inline void IOUring::sq_start_push() { sq_new_tail_ = load_acquire(sq_tail_); }
 
+/**
+ * @brief Finialises SQ pushes.
+ *
+ * Must be called after a series of @ref sq_push() calls.
+ */
 inline void IOUring::sq_end_push() { store_release(sq_tail_, sq_new_tail_); }
 
+/**
+ * @brief Takes a CQE off the CQ.
+ *
+ * Prior to a series of cq_pop() calls, @ref cq_start_pop() must be called.
+ * After a series of cq_pop() calls, @ref cq_end_pop() must be called.
+ *
+ * @return A pointer to an io_uring_cqe, or nullptr if the CQ is empty. The
+ * pointer becomes invalid after a call to @ref cq_end_pop().
+ */
 inline io_uring_cqe *IOUring::cq_pop() {
     // CQ is empty
     // Barrier to make sure that cq_save_head_ is updated prior to load
@@ -187,8 +248,18 @@ inline io_uring_cqe *IOUring::cq_pop() {
     return &cq_array_[cq_new_head_++ & cq_mask_];
 }
 
+/**
+ * @brief Initialises popping from CQ.
+ *
+ * @see cq_pop() for details.
+ */
 inline void IOUring::cq_start_pop() { cq_new_head_ = load_acquire(cq_head_); }
 
+/**
+ * @brief Finishes popping from CQ.
+ *
+ * @see cq_pop() for details.
+ */
 inline void IOUring::cq_end_pop() { store_release(cq_head_, cq_new_head_); }
 
 #endif // WOLF_IOURING_H_INCLUDED
