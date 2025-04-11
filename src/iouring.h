@@ -213,6 +213,7 @@ inline void IOUring::sq_push(std::uint8_t opcode, int fd, std::uint64_t off,
     sq_sqes_[index].user_data = std::bit_cast<std::uint64_t>(user_data);
 
     sq_array_[index] = index;
+    to_submit_++;
 }
 
 /**
