@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
 
 #include <linux/io_uring.h>
@@ -44,7 +45,7 @@ private:
 class IOUring {
 public:
     IOUring(std::uint32_t entries);
-    ~IOUring();
+    ~IOUring() = default;
     IOUring(const IOUring &) = delete;
     IOUring(IOUring &&ref);
 
@@ -64,24 +65,40 @@ public:
     void cq_end_pop();
 
 private:
-    int fd_ = -1;
+    class MmapDeleter {
+    public:
+        MmapDeleter() {}
+        MmapDeleter(std::size_t size) : size_(size) {}
+
+        void operator()(void *ptr) { munmap(ptr, size_); }
+
+    private:
+        std::size_t size_ = 0;
+    };
+
+    struct FdDeleter {
+        ~FdDeleter() {
+            if (fd >= 0)
+                ::close(fd);
+        }
+        int fd = -1;
+    };
+
+    FdDeleter fd_;
     int to_submit_ = 0;
 
     std::uint32_t sq_size_ = 0;
     std::uint32_t cq_size_ = 0;
 
-    std::size_t sq_ptr_size_ = 0;
-    void *sq_ptr_ = nullptr;
+    std::unique_ptr<void, MmapDeleter> sq_ptr_;
     std::uint32_t *sq_head_ = nullptr;
     std::uint32_t *sq_tail_ = nullptr;
     std::uint32_t sq_new_tail_ = 0;
     std::uint32_t sq_mask_ = 0;
     std::uint32_t *sq_array_ = nullptr;
-    std::size_t sq_sqes_size_ = 0;
-    io_uring_sqe *sq_sqes_ = nullptr;
+    std::unique_ptr<io_uring_sqe[], MmapDeleter> sq_sqes_;
 
-    std::size_t cq_ptr_size_ = 0;
-    void *cq_ptr_ = nullptr;
+    std::unique_ptr<void, MmapDeleter> cq_ptr_;
     std::uint32_t *cq_head_ = nullptr;
     std::uint32_t cq_new_head_ = 0;
     std::uint32_t *cq_tail_ = nullptr;
@@ -105,52 +122,50 @@ inline IOUring::IOUring(std::uint32_t entries) {
     if (fd < 0) {
         throw IOUringException("io_uring_setup: failed");
     }
-    fd_ = fd;
+    fd_.fd = fd;
 
     sq_size_ = params.sq_entries;
     cq_size_ = params.cq_entries;
 
-    sq_ptr_size_ = params.sq_off.array + sq_size_ * sizeof(std::uint32_t);
-    sq_ptr_ = mmap(0, sq_ptr_size_, PROT_READ | PROT_WRITE,
-                   MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
-    if (sq_ptr_ == MAP_FAILED) {
+    std::size_t sq_mmap_size =
+        params.sq_off.array + sq_size_ * sizeof(std::uint32_t);
+    void *sq_ptr = mmap(0, sq_mmap_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+    if (sq_ptr == MAP_FAILED) {
         throw IOUringException("mmap: failed to mmap sqring");
     }
-    sq_head_ = (std::uint32_t *)((std::uint8_t *)sq_ptr_ + params.sq_off.head);
-    sq_tail_ = (std::uint32_t *)((std::uint8_t *)sq_ptr_ + params.sq_off.tail);
+    sq_ptr_ =
+        std::unique_ptr<void, MmapDeleter>(sq_ptr, MmapDeleter(sq_mmap_size));
+    sq_head_ = (std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.head);
+    sq_tail_ = (std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.tail);
     sq_mask_ =
-        *(std::uint32_t *)((std::uint8_t *)sq_ptr_ + params.sq_off.ring_mask);
-    sq_array_ =
-        (std::uint32_t *)((std::uint8_t *)sq_ptr_ + params.sq_off.array);
+        *(std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.ring_mask);
+    sq_array_ = (std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.array);
 
-    sq_sqes_size_ = sq_size_ * sizeof(struct io_uring_sqe);
-    sq_sqes_ =
-        (io_uring_sqe *)mmap(0, sq_sqes_size_, PROT_READ | PROT_WRITE,
+    std::size_t sq_sqes_mmap_size = sq_size_ * sizeof(struct io_uring_sqe);
+    void *sq_sqes =
+        (io_uring_sqe *)mmap(0, sq_sqes_mmap_size, PROT_READ | PROT_WRITE,
                              MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
-    if (sq_sqes_ == MAP_FAILED) {
+    if (sq_sqes == MAP_FAILED) {
         throw IOUringException("mmap: failed to mmap sqentries");
     }
+    sq_sqes_ = std::unique_ptr<io_uring_sqe[], MmapDeleter>(
+        (io_uring_sqe *)sq_sqes, MmapDeleter(sq_sqes_mmap_size));
 
-    cq_ptr_size_ = params.cq_off.cqes + cq_size_ * sizeof(struct io_uring_cqe);
-    cq_ptr_ = mmap(0, cq_ptr_size_, PROT_READ | PROT_WRITE,
-                   MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
-    if (cq_ptr_ == MAP_FAILED) {
+    std::size_t cq_mmap_size =
+        params.cq_off.cqes + cq_size_ * sizeof(struct io_uring_cqe);
+    void *cq_ptr = mmap(0, cq_mmap_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+    if (cq_ptr == MAP_FAILED) {
         throw IOUringException("mmap: failed to mmap cqring");
     }
-    cq_head_ = (std::uint32_t *)((std::uint8_t *)cq_ptr_ + params.cq_off.head);
-    cq_tail_ = (std::uint32_t *)((std::uint8_t *)cq_ptr_ + params.cq_off.tail);
+    cq_ptr_ =
+        std::unique_ptr<void, MmapDeleter>(cq_ptr, MmapDeleter(cq_mmap_size));
+    cq_head_ = (std::uint32_t *)((std::uint8_t *)cq_ptr + params.cq_off.head);
+    cq_tail_ = (std::uint32_t *)((std::uint8_t *)cq_ptr + params.cq_off.tail);
     cq_mask_ =
-        *(std::uint32_t *)((std::uint8_t *)cq_ptr_ + params.cq_off.ring_mask);
-    cq_array_ = (io_uring_cqe *)((std::uint8_t *)cq_ptr_ + params.cq_off.cqes);
-}
-
-inline IOUring::~IOUring() {
-    if (fd_ >= 0) {
-        munmap((void *)sq_ptr_, sq_ptr_size_);
-        munmap((void *)sq_sqes_, sq_sqes_size_);
-        munmap((void *)cq_ptr_, cq_ptr_size_);
-        close(fd_);
-    }
+        *(std::uint32_t *)((std::uint8_t *)cq_ptr + params.cq_off.ring_mask);
+    cq_array_ = (io_uring_cqe *)((std::uint8_t *)cq_ptr + params.cq_off.cqes);
 }
 
 /**
@@ -163,7 +178,7 @@ inline void IOUring::enter(int timeout) {
     // Kernel >= 5.11
     __kernel_timespec ts{.tv_sec = timeout};
     io_uring_getevents_arg arg{.ts = std::bit_cast<std::uint64_t>(&ts)};
-    syscall(SYS_io_uring_enter, fd_, to_submit_, 1,
+    syscall(SYS_io_uring_enter, fd_.fd, to_submit_, 1,
             IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
             std::bit_cast<std::uint64_t>(&arg), sizeof(arg));
 
