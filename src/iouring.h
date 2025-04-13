@@ -84,26 +84,33 @@ private:
         int fd = -1;
     };
 
+    // Memory order is intentional to prevent unnecessary padding
+
     FdDeleter fd_;
     int to_submit_ = 0;
 
+    // SQ ints
     std::uint32_t sq_size_ = 0;
-    std::uint32_t cq_size_ = 0;
+    std::uint32_t sq_mask_ = 0;
+    std::uint32_t sq_new_tail_ = 0;
 
+    // CQ ints
+    std::uint32_t cq_size_ = 0;
+    std::uint32_t cq_mask_ = 0;
+    std::uint32_t cq_new_head_ = 0;
+
+    // SQ ptrs
     std::unique_ptr<void, MmapDeleter> sq_ptr_;
+    std::unique_ptr<io_uring_sqe[], MmapDeleter> sq_sqes_;
+    std::uint32_t *sq_array_ = nullptr;
     std::uint32_t *sq_head_ = nullptr;
     std::uint32_t *sq_tail_ = nullptr;
-    std::uint32_t sq_new_tail_ = 0;
-    std::uint32_t sq_mask_ = 0;
-    std::uint32_t *sq_array_ = nullptr;
-    std::unique_ptr<io_uring_sqe[], MmapDeleter> sq_sqes_;
 
+    // CQ ptrs
     std::unique_ptr<void, MmapDeleter> cq_ptr_;
-    std::uint32_t *cq_head_ = nullptr;
-    std::uint32_t cq_new_head_ = 0;
-    std::uint32_t *cq_tail_ = nullptr;
-    std::uint32_t cq_mask_ = 0;
     io_uring_cqe *cq_array_ = nullptr;
+    std::uint32_t *cq_head_ = nullptr;
+    std::uint32_t *cq_tail_ = nullptr;
 };
 
 /**
