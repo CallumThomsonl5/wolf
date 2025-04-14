@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <bit>
+#include <bits/types/sigset_t.h>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -28,6 +29,32 @@ static inline void store_release(T *ptr, T value) {
                                std::memory_order::release);
 }
 
+static inline int io_uring_enter(std::uint32_t fd, std::uint32_t to_submit,
+                                 std::uint32_t min_complete,
+                                 std::uint32_t flags, sigset_t *sig,
+                                 std::size_t sz) {
+
+    int ret = -1;
+#if defined(__x86_64__)
+    register std::uint32_t r10 asm("r10") = flags;
+    register sigset_t *r8 asm("r8") = sig;
+    register std::size_t r9 asm("r9") = sz;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "a"(SYS_io_uring_enter), "D"(fd), "S"(to_submit),
+                   "d"(min_complete), "r"(r10), "r"(r8), "r"(r9)
+                 : "rcx", "r11", "memory");
+#else
+    ret = syscall(SYS_io_uring_enter, fd, to_submit, min_complete, flags, sig,
+                  sz);
+#endif
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
 /**
  * @brief Indicates error with iouring
  */
@@ -51,7 +78,7 @@ public:
     IOUring(IOUring &&ref);
 
     template <typename Rep, typename Period>
-    void enter(std::chrono::duration<Rep, Period> timeout);
+    int enter(std::chrono::duration<Rep, Period> timeout);
 
     bool sq_full() const;
     void sq_push(io_uring_sqe sqe);
@@ -178,24 +205,24 @@ inline IOUring::IOUring(std::uint32_t entries) {
 }
 
 /**
- * @brief Attempts to submit SQs then waits for at least one completion, or times out.
+ * @brief Attempts to submit SQs then waits for at least one completion, or
+ * times out.
  *
  * @param timeout Maximum time to block before timing out.
  */
 template <typename Rep, typename Period>
-inline void IOUring::enter(std::chrono::duration<Rep, Period> timeout) {
+inline int IOUring::enter(std::chrono::duration<Rep, Period> timeout) {
     // Kernel >= 5.11
-    auto secs =
-        std::chrono::duration_cast<std::chrono::seconds>(timeout);
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(timeout);
     auto ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - secs);
     __kernel_timespec ts{.tv_sec = secs.count(), .tv_nsec = ns.count()};
     io_uring_getevents_arg arg{.ts = std::bit_cast<std::uint64_t>(&ts)};
-    syscall(SYS_io_uring_enter, fd_.fd, to_submit_, 1,
-            IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
-            std::bit_cast<std::uint64_t>(&arg), sizeof(arg));
-
+    int ret = io_uring_enter(fd_.fd, to_submit_, 1,
+                             IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
+                             std::bit_cast<sigset_t *>(&arg), sizeof(arg));
     to_submit_ = 0;
+    return ret;
 }
 
 /**
