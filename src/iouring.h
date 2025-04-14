@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -49,7 +50,8 @@ public:
     IOUring(const IOUring &) = delete;
     IOUring(IOUring &&ref);
 
-    void enter(int timeout);
+    template <typename Rep, typename Period>
+    void enter(std::chrono::duration<Rep, Period> timeout);
 
     bool sq_full() const;
     void sq_push(io_uring_sqe sqe);
@@ -176,14 +178,18 @@ inline IOUring::IOUring(std::uint32_t entries) {
 }
 
 /**
- * @brief Attempts to submit SQs and waits for the completion of at least one
- * CQE, or timeout seconds.
+ * @brief Attempts to submit SQs then waits for at least one completion, or times out.
  *
- * @param timeout Maximum time in seconds to block before returning.
+ * @param timeout Maximum time to block before timing out.
  */
-inline void IOUring::enter(int timeout) {
+template <typename Rep, typename Period>
+inline void IOUring::enter(std::chrono::duration<Rep, Period> timeout) {
     // Kernel >= 5.11
-    __kernel_timespec ts{.tv_sec = timeout};
+    auto secs =
+        std::chrono::duration_cast<std::chrono::seconds>(timeout);
+    auto ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - secs);
+    __kernel_timespec ts{.tv_sec = secs.count(), .tv_nsec = ns.count()};
     io_uring_getevents_arg arg{.ts = std::bit_cast<std::uint64_t>(&ts)};
     syscall(SYS_io_uring_enter, fd_.fd, to_submit_, 1,
             IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
