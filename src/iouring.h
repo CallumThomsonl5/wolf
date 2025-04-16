@@ -79,6 +79,7 @@ public:
 
     template <typename Rep, typename Period>
     int enter(std::chrono::duration<Rep, Period> timeout);
+    int enter();
 
     bool sq_full() const;
     void sq_push(io_uring_sqe sqe);
@@ -218,6 +219,21 @@ inline int IOUring::enter(std::chrono::duration<Rep, Period> timeout) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - secs);
     __kernel_timespec ts{.tv_sec = secs.count(), .tv_nsec = ns.count()};
     io_uring_getevents_arg arg{.ts = std::bit_cast<std::uint64_t>(&ts)};
+    int ret = io_uring_enter(fd_.fd, to_submit_, 1,
+                             IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
+                             std::bit_cast<sigset_t *>(&arg), sizeof(arg));
+    to_submit_ = 0;
+    return ret;
+}
+
+/**
+ * @brief Attempts to submit SQs then waits for at least one completion.
+ *
+ * Never times out unlike overloaded version.
+ */
+inline int IOUring::enter() {
+    // Kernel >= 5.11
+    io_uring_getevents_arg arg{};
     int ret = io_uring_enter(fd_.fd, to_submit_, 1,
                              IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
                              std::bit_cast<sigset_t *>(&arg), sizeof(arg));
