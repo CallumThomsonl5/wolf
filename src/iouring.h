@@ -2,13 +2,10 @@
 #define WOLF_IOURING_H_INCLUDED
 
 #include <atomic>
-#include <bit>
-#include <bits/types/sigset_t.h>
 #include <chrono>
 #include <cstdint>
-#include <exception>
 #include <memory>
-#include <string>
+#include <stdexcept>
 
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
@@ -44,28 +41,17 @@ static inline int io_uring_enter(std::uint32_t fd, std::uint32_t to_submit,
                  : "a"(SYS_io_uring_enter), "D"(fd), "S"(to_submit),
                    "d"(min_complete), "r"(r10), "r"(r8), "r"(r9)
                  : "rcx", "r11", "memory");
-#else
-    ret = syscall(SYS_io_uring_enter, fd, to_submit, min_complete, flags, sig,
-                  sz);
-#endif
     if (ret < 0) {
         errno = -ret;
         return -1;
     }
+#else
+    ret = syscall(SYS_io_uring_enter, fd, to_submit, min_complete, flags, sig,
+                  sz);
+#endif
+
     return ret;
 }
-
-/**
- * @brief Indicates error with iouring
- */
-class IOUringException : public std::exception {
-public:
-    IOUringException(const std::string &msg) : msg_(msg) {}
-    const char *what() const noexcept override { return msg_.c_str(); }
-
-private:
-    const std::string msg_;
-};
 
 /**
  * @brief A wrapper over the io_uring interface with a simplified API and RAII.
@@ -146,7 +132,7 @@ private:
 /**
  * @brief Attempts to setup iouring.
  *
- * @throws IOUringException if there is an error setting up the ring.
+ * @throws std::runtime_error if there is an error setting up the ring.
  */
 inline IOUring::IOUring(std::uint32_t entries) {
     struct io_uring_params params{
@@ -157,7 +143,7 @@ inline IOUring::IOUring(std::uint32_t entries) {
 
     int fd = syscall(SYS_io_uring_setup, entries, &params);
     if (fd < 0) {
-        throw IOUringException("io_uring_setup: failed");
+        throw std::runtime_error("io_uring_setup: failed");
     }
     fd_.fd = fd;
 
@@ -169,7 +155,7 @@ inline IOUring::IOUring(std::uint32_t entries) {
     void *sq_ptr = mmap(0, sq_mmap_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
     if (sq_ptr == MAP_FAILED) {
-        throw IOUringException("mmap: failed to mmap sqring");
+        throw std::runtime_error("mmap: failed to mmap sqring");
     }
     sq_ptr_ =
         std::unique_ptr<void, MmapDeleter>(sq_ptr, MmapDeleter(sq_mmap_size));
@@ -184,7 +170,7 @@ inline IOUring::IOUring(std::uint32_t entries) {
         (io_uring_sqe *)mmap(0, sq_sqes_mmap_size, PROT_READ | PROT_WRITE,
                              MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
     if (sq_sqes == MAP_FAILED) {
-        throw IOUringException("mmap: failed to mmap sqentries");
+        throw std::runtime_error("mmap: failed to mmap sqentries");
     }
     sq_sqes_ = std::unique_ptr<io_uring_sqe[], MmapDeleter>(
         (io_uring_sqe *)sq_sqes, MmapDeleter(sq_sqes_mmap_size));
@@ -194,7 +180,7 @@ inline IOUring::IOUring(std::uint32_t entries) {
     void *cq_ptr = mmap(0, cq_mmap_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
     if (cq_ptr == MAP_FAILED) {
-        throw IOUringException("mmap: failed to mmap cqring");
+        throw std::runtime_error("mmap: failed to mmap cqring");
     }
     cq_ptr_ =
         std::unique_ptr<void, MmapDeleter>(cq_ptr, MmapDeleter(cq_mmap_size));
@@ -222,8 +208,12 @@ inline int IOUring::enter(std::chrono::duration<Rep, Period> timeout) {
     int ret = io_uring_enter(fd_.fd, to_submit_, 1,
                              IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
                              std::bit_cast<sigset_t *>(&arg), sizeof(arg));
-    to_submit_ = 0;
-    return ret;
+    if (ret >= 0) {
+        to_submit_ -= ret;
+        return 0;
+    } else {
+        return ret;
+    }
 }
 
 /**
@@ -237,8 +227,12 @@ inline int IOUring::enter() {
     int ret = io_uring_enter(fd_.fd, to_submit_, 1,
                              IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
                              std::bit_cast<sigset_t *>(&arg), sizeof(arg));
-    to_submit_ = 0;
-    return ret;
+    if (ret >= 0) {
+        to_submit_ -= ret;
+        return 0;
+    } else {
+        return ret;
+    }
 }
 
 /**

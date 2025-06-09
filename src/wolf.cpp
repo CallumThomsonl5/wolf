@@ -1,105 +1,37 @@
+#include <wolf.h>
+
+#include <cerrno>
+#include <condition_variable>
+#include <cstddef>
+#include <cstring>
+#include <mutex>
+#include <stdexcept>
+#include <vector>
+
 #include <arpa/inet.h>
 #include <linux/io_uring.h>
 #include <netinet/in.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 
-#include <condition_variable>
-#include <cstddef>
-#include <cstring>
-#include <iostream>
-#include <memory>
-#include <mutex>
-#include <thread>
-#include <variant>
-#include <vector>
-
 #include <iouring.h>
-#include <wolf.h>
+#include <mpsc_queue.h>
 
 namespace wolf {
 
-constexpr std::size_t MAX_DATA_TRANSFER = 65535;
-constexpr std::uint32_t RING_ENTRIES_HINT = 1024;
-constexpr std::uint32_t LISTEN_BACKLOG = 1024;
-
-using WatchListItem = std::variant<TcpListener *>;
-
-/**
- * @brief Creates a socket and starts listening.
- *
- * @throws ListenerException if creation fails.
- */
-TcpListener::TcpListener(std::uint32_t host, std::uint16_t port,
-                         on_accept_cb_t on_accept)
-    : host_(host), port_(port), on_accept_cb_(std::move(on_accept)) {
-    fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (fd_ < 0) {
-        throw ListenerException(std::format(
-            "Listener: failed to create socket. Got {}", strerror(errno)));
-    }
-
-    int val = 1;
-    int err =
-        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, (void *)&val, sizeof(val));
-    if (err < 0) {
-        close(fd_);
-        throw ListenerException(std::format(
-            "Listener: failed to set SO_REUSEADDR. Got {}", strerror(errno)));
-    }
-
-    val = 1;
-    err = setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, (void *)&val, sizeof(val));
-    if (err < 0) {
-        close(fd_);
-        throw ListenerException(std::format(
-            "Listener: failed to set SO_REUSEPORT. Got {}", strerror(errno)));
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(host);
-    addr.sin_port = htons(port);
-    err = bind(fd_, (sockaddr *)&addr, sizeof(addr));
-    if (err < 0) {
-        close(fd_);
-        throw ListenerException(
-            std::format("Listener: failed to bind to {}:{}. Got {}", host, port,
-                        strerror(errno)));
-    }
-
-    err = listen(fd_, LISTEN_BACKLOG);
-    if (err < 0) {
-        close(fd_);
-        throw ListenerException(std::format(
-            "Listener: failed to start listening. Got {}", strerror(errno)));
-    }
-}
-
-/**
- * @brief Closes the associated file descriptor
- */
-TcpListener::~TcpListener() { close(fd_); }
-
-/**
- * @brief Returns the associated fd.
- */
-int TcpListener::fd() { return fd_; }
+static constexpr std::size_t MAX_DATA_TRANSFER = 65535;
+static constexpr std::uint32_t RING_ENTRIES_HINT = 1024;
+static constexpr std::uint32_t LISTEN_BACKLOG = 4096;
 
 /**
  * @brief Initialises the event loop threads
  *
  * @param threads Number of threads to use
  */
-EventLoop::EventLoop(int threads)
-    : thread_handles_(std::make_unique<ThreadHandle[]>(threads)),
-      threads_(std::make_unique<std::thread[]>(threads)),
-      threads_count_(threads) {
-
+EventLoop::EventLoop(int threads) {
     for (int i = 0; i < threads; i++) {
-        std::thread t(&EventLoop::thread_loop, this, i);
-        threads_[i] = std::move(t);
-        thread_handles_[i].wake_fd = eventfd(1, 0);
+        message_queues_.emplace_back(eventfd(1, 0));
+        threads_.emplace_back(&EventLoop::thread_loop, this, i);
     }
 }
 
@@ -115,25 +47,97 @@ void EventLoop::run() {
     }
     thread_start_cv_.notify_all();
 
-    for (int i = 0; i < threads_count_; i++) {
+    for (int i = 0; i < threads_.size(); i++) {
         threads_[i].join();
     }
 }
 
-/**
- * @brief Attaches a listner to the event loop so that it can begin accepting
- * connections.
- */
-void EventLoop::attach(TcpListener &listener) {
-    for (int i = 0; i < threads_count_; i++) {
-        {
-            std::lock_guard<std::mutex> l(thread_handles_[i].mtx);
-            thread_handles_[i].msg_queue.push(
-                {.op = MessageOperation::ATTACH_LISTENER,
-                 .entity = {.listener = &listener}});
+static NetworkError create_listening_socket(std::uint32_t host,
+                                            std::uint16_t port,
+                                            int &socket_fd) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        switch (errno) {
+        case EACCES:
+            return NetworkError::PermissionDenied;
+        case EMFILE:
+            return NetworkError::LimitReached;
+        case ENOMEM:
+            return NetworkError::NoMemory;
+        default:
+            return NetworkError::Unknown;
         }
-        eventfd_write(thread_handles_[i].wake_fd, 1);
     }
+
+    int val = 1;
+    int err =
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&val, sizeof(val));
+    if (err != 0) {
+        close(fd);
+        return NetworkError::Unknown;
+    }
+
+    err = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (void *)&val, sizeof(val));
+    if (err != 0) {
+        close(fd);
+        return NetworkError::Unknown;
+    }
+
+    sockaddr_in addr{.sin_family = AF_INET,
+                     .sin_port = htons(port),
+                     .sin_addr = {.s_addr = htonl(host)}};
+    err = bind(fd, (sockaddr *)&addr, sizeof(addr));
+    if (err != 0) {
+        close(fd);
+        switch (errno) {
+        case EACCES:
+            return NetworkError::PermissionDenied;
+        case EADDRINUSE:
+            return NetworkError::AddressInUse;
+        default:
+            return NetworkError::Unknown;
+        }
+    }
+
+    err = listen(fd, LISTEN_BACKLOG);
+    if (err != 0) {
+        close(fd);
+        switch (errno) {
+        case EADDRINUSE:
+            return NetworkError::AddressInUse;
+        default:
+            return NetworkError::Unknown;
+        }
+    }
+
+    socket_fd = fd;
+    return NetworkError::Ok;
+}
+
+/**
+ * @brief Creates a socket and starts listening.
+ */
+NetworkError EventLoop::tcp_listen(std::uint32_t host, std::uint16_t port,
+                                   on_accept_t on_accept) {
+    std::vector<int> sockets;
+    for (int i = 0; i < threads_.size(); i++) {
+        int fd;
+        NetworkError err = create_listening_socket(host, port, fd);
+        if (err != NetworkError::Ok) {
+            for (int f : sockets) {
+                close(f);
+            }
+            return err;
+        }
+        sockets.push_back(fd);
+    }
+
+    for (int i = 0; i < threads_.size(); i++) {
+        message_queues_[i].push({.op = MessageOperation::AttachListener,
+                                 .fd = sockets[i],
+                                 .callback = {.on_accept = on_accept}});
+    }
+    return NetworkError::Ok;
 }
 
 /**
@@ -143,9 +147,9 @@ void EventLoop::attach(TcpListener &listener) {
 void watch_list_push(std::vector<WatchListItem> &watch_list, WatchListItem item,
                      int fd) {
     if (watch_list.size() <= fd) {
-        watch_list.resize(watch_list.size() + 1);
+        watch_list.resize(fd + 1);
     }
-    watch_list[fd] = std::move(item);
+    watch_list[fd] = item;
 }
 
 /**
@@ -153,39 +157,34 @@ void watch_list_push(std::vector<WatchListItem> &watch_list, WatchListItem item,
  */
 static void handle_messages(IOUring &ring,
                             std::vector<WatchListItem> &watch_list,
-                            ThreadHandle &thread_handle, int wake_fd,
-                            std::uint64_t *wake_buf) {
-    while (true) {
-        Message msg;
-        {
-            std::lock_guard<std::mutex> l(thread_handle.mtx);
-            if (thread_handle.msg_queue.empty())
-                break;
-            msg = thread_handle.msg_queue.front();
-            thread_handle.msg_queue.pop();
-        }
-
+                            MPSCQueue<Message> &message_queue,
+                            const std::uint64_t *wake_buf) {
+    std::vector<Message> messages = message_queue.drain();
+    for (Message &msg : messages) {
         switch (msg.op) {
-        case MessageOperation::ATTACH_LISTENER:
-            TcpListener *listener = msg.entity.listener;
-
+        case MessageOperation::AttachListener:
             // Multishot kernel >= 6.0
-            ring.sq_push(io_uring_sqe{
-                .opcode = IORING_OP_ACCEPT,
-                .fd = listener->fd(),
-                .user_data = static_cast<std::uint64_t>(listener->fd())});
-            watch_list_push(watch_list, WatchListItem(listener),
-                            listener->fd());
+            ring.sq_push(
+                io_uring_sqe{.opcode = IORING_OP_ACCEPT,
+                             .ioprio = IORING_ACCEPT_MULTISHOT,
+                             .fd = msg.fd,
+                             .user_data = static_cast<std::uint64_t>(msg.fd)});
+
+            watch_list_push(
+                watch_list,
+                WatchListItem{.type = WatchListItemType::Listener,
+                              .item = {.listener = msg.callback.on_accept}},
+                msg.fd);
             break;
         }
     }
 
     // rearm
     ring.sq_push({.opcode = IORING_OP_READ,
-                  .fd = wake_fd,
+                  .fd = message_queue.wake_fd(),
                   .addr = std::bit_cast<std::uint64_t>(&wake_buf),
                   .len = sizeof(wake_buf),
-                  .user_data = (std::uint64_t)wake_fd});
+                  .user_data = (std::uint64_t)message_queue.wake_fd()});
 }
 
 /**
@@ -199,44 +198,43 @@ void EventLoop::thread_loop(int thread_id) {
 
     IOUring ring(RING_ENTRIES_HINT);
     std::vector<WatchListItem> watch_list;
-    ThreadHandle &this_handle = thread_handles_[thread_id];
+    MPSCQueue<Message> &message_queue = message_queues_[thread_id];
 
     // Setup wake eventfd
-    const int wake_fd = this_handle.wake_fd;
     std::uint64_t wake_buf;
     ring.sq_start_push();
     ring.sq_push({.opcode = IORING_OP_READ,
-                  .fd = wake_fd,
+                  .fd = message_queue.wake_fd(),
                   .addr = std::bit_cast<std::uint64_t>(&wake_buf),
                   .len = sizeof(wake_buf),
-                  .user_data = (std::uint64_t)wake_fd});
+                  .user_data = (std::uint64_t)message_queue.wake_fd()});
     ring.sq_end_push();
 
     while (is_running_) {
         int ret = ring.enter();
         if (ret < 0) {
-            throw IOUringException(
+            throw std::runtime_error(
                 std::format("iouring: enter failed. Got {}", strerror(ret)));
         }
 
         ring.sq_start_push();
         ring.cq_start_pop();
         while (io_uring_cqe *cqe = ring.cq_pop()) {
-            if (cqe->user_data == wake_fd) {
-                handle_messages(ring, watch_list, this_handle, wake_fd,
-                                &wake_buf);
+            if (cqe->user_data == message_queue.wake_fd()) {
+                handle_messages(ring, watch_list, message_queue, &wake_buf);
                 continue;
             }
 
             int fd = static_cast<int>(cqe->user_data);
-            WatchListItem *item = &watch_list[fd];
-            if (TcpListener **listener_ptr = std::get_if<TcpListener *>(item)) {
-                TcpListener *listener = *listener_ptr;
+            WatchListItem &item = watch_list[fd];
+            if (item.type == WatchListItemType::Listener) {
+                item.item.listener();
 
                 // TODO: handle accept cqe properly
-                std::cout << std::format(
-                    "accepted res: {}, user_data: {}, thread_id: {}\n",
-                    cqe->res, cqe->user_data, thread_id);
+                if (cqe->res < 0) {
+                    throw std::runtime_error(std::format(
+                        "got err accepting: {}", strerror(-cqe->res)));
+                }
             }
         }
         ring.cq_end_pop();

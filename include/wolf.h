@@ -1,58 +1,45 @@
 #ifndef WOLF_H_INCLUDED
 #define WOLF_H_INCLUDED
 
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 #include <sys/eventfd.h>
 
-#include <condition_variable>
-#include <functional>
-#include <mutex>
-#include <queue>
-#include <thread>
+#include <mpsc_queue.h>
 
 namespace wolf {
 
-/**
- * @brief Indicates error with listener
- */
-class ListenerException : public std::exception {
-public:
-    ListenerException(const std::string &msg) : msg_(msg) {}
-    const char *what() const noexcept override { return msg_.c_str(); }
+using on_accept_t = void (*)();
 
-private:
-    const std::string msg_;
+enum class NetworkError {
+    Ok,
+    PermissionDenied,
+    LimitReached,
+    NoMemory,
+    AddressInUse,
+    Unknown
 };
 
-class TcpListener {
-    using on_accept_cb_t = std::function<void()>;
-
-public:
-    TcpListener(std::uint32_t host, std::uint16_t port,
-                on_accept_cb_t on_accept);
-    ~TcpListener();
-
-    int fd();
-
-private:
-    int fd_;
-    std::uint32_t host_;
-    std::uint16_t port_;
-    on_accept_cb_t on_accept_cb_;
-};
-
-enum class MessageOperation : std::uint8_t { ATTACH_LISTENER };
+enum class MessageOperation : std::uint8_t { AttachListener };
 
 struct Message {
     MessageOperation op;
+    int fd;
     union {
-        TcpListener *listener;
-    } entity;
+        on_accept_t on_accept;
+    } callback;
 };
 
-struct ThreadHandle {
-    std::queue<Message> msg_queue;
-    std::mutex mtx;
-    int wake_fd;
+enum class WatchListItemType : std::uint8_t { Listener };
+
+struct WatchListItem {
+    WatchListItemType type;
+    union {
+        on_accept_t listener; // listener just on_accept callback for now
+    } item;
 };
 
 /**
@@ -65,7 +52,8 @@ public:
 
     void run();
 
-    void attach(TcpListener &listener);
+    NetworkError tcp_listen(std::uint32_t host, std::uint16_t port,
+                            on_accept_t on_accept);
 
 private:
     void thread_loop(int thread_id);
@@ -73,10 +61,14 @@ private:
     bool is_running_ = false;
     std::mutex thread_start_mutex_;
     std::condition_variable thread_start_cv_;
-    std::unique_ptr<ThreadHandle[]> thread_handles_;
-    std::unique_ptr<std::thread[]> threads_;
-    int threads_count_ = 0;
+    std::vector<MPSCQueue<Message>> message_queues_;
+    std::vector<std::thread> threads_;
 };
+
+inline std::uint32_t ipv4_address(std::uint8_t one, std::uint8_t two,
+                                  std::uint8_t three, std::uint8_t four) {
+    return (one << 24) | (two << 16) | (three << 8) | four;
+}
 
 } // namespace wolf
 
