@@ -47,6 +47,7 @@ struct WatchListItem {
  */
 class EventLoop {
 public:
+    EventLoop();
     explicit EventLoop(int threads);
     ~EventLoop();
 

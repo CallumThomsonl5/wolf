@@ -35,6 +35,16 @@ EventLoop::EventLoop(int threads) {
     }
 }
 
+/**
+ * @brief Initialises the event loop, using std::thread::hardware_concurrnecy number of threads
+ */
+EventLoop::EventLoop() {
+    for (int i = 0; i < std::thread::hardware_concurrency(); i++) {
+        message_queues_.emplace_back(eventfd(1, 0));
+        threads_.emplace_back(&EventLoop::thread_loop, this, i);
+    }
+}
+
 EventLoop::~EventLoop() = default;
 
 /**
