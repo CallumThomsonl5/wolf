@@ -139,19 +139,30 @@ EventLoop::EventLoop(int thread_id)
     }
 }
 
+void EventLoop::post(Message msg) {
+    msg_queue_.push(msg);
+    wake();
+}
+
 void EventLoop::tcp_listen(std::uint32_t host, std::uint16_t port,
                            OnListen on_listen, OnAccept on_accept,
                            OnRead on_read, OnWrite on_write, OnClose on_close) {
     if (thread_loop == this) {
-        TcpListenerView listener(0, *this);
-        NetworkError err = do_tcp_listen(host, port, listener, on_accept,
-                                         on_read, on_write, on_close);
-        on_listen(*this, listener, err);
+        do_tcp_listen(host, port, on_listen, on_accept, on_read, on_write,
+                      on_close);
     } else {
-        // TODO
-        throw std::runtime_error("Not implemented");
+        post({.msg = {.create_listener = {.host = host,
+                                          .port = port,
+                                          .on_listen = on_listen,
+                                          .on_accept = on_accept,
+                                          .on_read = on_read,
+                                          .on_write = on_write,
+                                          .on_close = on_close}},
+              .type = MessageType::CreateListener});
     }
 }
+
+void EventLoop::wake() { eventfd_write(wake_fd_, 1); }
 
 void EventLoop::handle_cqe(io_uring_cqe *cqe) {
     std::uint64_t handle = cqe->user_data;
@@ -160,10 +171,28 @@ void EventLoop::handle_cqe(io_uring_cqe *cqe) {
     case Op::TcpAccept:
         handle_accept(cqe->user_data, cqe->res, cqe->flags);
         break;
-
     case Op::Wake:
+        handle_messages();
         break;
     }
+}
+
+void EventLoop::handle_messages() {
+    std::vector<Message> messages = msg_queue_.drain();
+    for (Message &m : messages) {
+        switch (m.type) {
+        case MessageType::CreateListener:
+            CreateListenerMessage &msg = m.msg.create_listener;
+            do_tcp_listen(msg.host, msg.port, msg.on_listen, msg.on_accept,
+                          msg.on_read, msg.on_write, msg.on_close);
+            break;
+        }
+    }
+    ring_.sq_push({.opcode = IORING_OP_READ,
+                   .fd = wake_fd_,
+                   .addr = std::bit_cast<std::uint64_t>(&wake_buf_),
+                   .len = sizeof(wake_buf_),
+                   .user_data = add_operation(0, Op::Wake)});
 }
 
 TcpClientView EventLoop::create_client(int fd) {
@@ -201,15 +230,17 @@ void EventLoop::handle_accept(std::uint64_t handle, int result,
     }
 }
 
-NetworkError EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port,
-                                      TcpListenerView &listener,
-                                      OnAccept on_accept, OnRead on_read,
-                                      OnWrite on_write, OnClose on_close) {
+void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port,
+                              OnListen on_listen, OnAccept on_accept,
+                              OnRead on_read, OnWrite on_write,
+                              OnClose on_close) {
     int fd;
     NetworkError err = create_listening_socket(host, port, fd);
+    TcpListenerView listener(0, *this);
 
     if (err != NetworkError::Ok) {
-        return err;
+        on_listen(*this, listener, err);
+        return;
     }
 
     if (tcp_free_listeners_.empty()) {
@@ -241,7 +272,7 @@ NetworkError EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port,
                      .fd = fd,
                      .user_data = add_operation(handle, Op::TcpAccept)});
 
-    return NetworkError::Ok;
+    on_listen(*this, listener, err);
 }
 
 void EventLoop::run() {
@@ -251,7 +282,7 @@ void EventLoop::run() {
     // arm eventfd wake
     ring_.sq_start_push();
     // Kernel >= 6.7
-    ring_.sq_push({.opcode = IORING_OP_READ_MULTISHOT,
+    ring_.sq_push({.opcode = IORING_OP_READ,
                    .fd = wake_fd_,
                    .addr = std::bit_cast<std::uint64_t>(&wake_buf_),
                    .len = sizeof(wake_buf_),

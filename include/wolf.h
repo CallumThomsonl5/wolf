@@ -86,10 +86,29 @@ private:
     EventLoop *loop_;
 };
 
+enum class MessageType : std::uint8_t {
+    CreateListener
+};
+
+struct CreateListenerMessage {
+    std::uint32_t host;
+    std::uint16_t port;
+    OnListen on_listen;
+    OnAccept on_accept;
+    OnRead on_read;
+    OnWrite on_write;
+    OnClose on_close;
+};
+
 /**
  * @brief Used internally for passing messages between event loops.
  */
-struct Message {};
+struct Message {
+    union {
+        CreateListenerMessage create_listener;
+    } msg;
+    MessageType type;
+};
 
 /**
  * @brief The main class, handling the event loop.
@@ -98,6 +117,8 @@ class EventLoop {
 public:
     EventLoop(int thread_id = 0);
     ~EventLoop() = default;
+
+    void post(Message msg);
 
     void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
                     OnAccept on_accept, OnRead on_read, OnWrite on_write,
@@ -130,10 +151,10 @@ private:
 
     TcpClientView create_client(int fd);
     void handle_cqe(io_uring_cqe *cqe);
+    void handle_messages();
     void handle_accept(Handle handle, int result, std::uint32_t flags);
 
-    NetworkError do_tcp_listen(std::uint32_t host, std::uint16_t port,
-                               TcpListenerView &listener, OnAccept on_accept,
+    void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept,
                                OnRead on_read, OnWrite on_write,
                                OnClose on_close);
 };
