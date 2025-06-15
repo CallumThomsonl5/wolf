@@ -146,7 +146,7 @@ private:
 
     MPSCQueue<Message> msg_queue_;
     int wake_fd_;
-    int wake_buf_;
+    std::uint64_t wake_buf_;
     int thread_id_;
 
     TcpClientView create_client(int fd);
