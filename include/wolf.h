@@ -1,19 +1,34 @@
 #ifndef WOLF_H_INCLUDED
 #define WOLF_H_INCLUDED
 
-#include <condition_variable>
-#include <mutex>
-#include <thread>
+#include <cstdint>
+#include <stack>
 #include <vector>
 
-#include <sys/eventfd.h>
-
+#include <iouring.h>
 #include <mpsc_queue.h>
 
 namespace wolf {
 
-using on_accept_t = void (*)();
+// Forward declarations
+class EventLoop;
+class TcpClientView;
+class TcpListenerView;
+enum class NetworkError;
 
+// TODO: Come up with the real function signatures
+using OnListen = void (*)(EventLoop &, TcpListenerView, NetworkError err);
+using OnAccept = void (*)(EventLoop &, TcpClientView, NetworkError err);
+using OnConnect = void (*)(void);
+using OnRead = void (*)(void);
+using OnWrite = void (*)(void);
+using OnClose = void (*)(void);
+
+using Handle = std::uint64_t;
+
+/**
+ * @brief Errors that can arise during networking.
+ */
 enum class NetworkError {
     Ok,
     PermissionDenied,
@@ -23,47 +38,104 @@ enum class NetworkError {
     Unknown
 };
 
-enum class MessageOperation : std::uint8_t { AttachListener };
-
-struct Message {
-    MessageOperation op;
+/**
+ * @brief Owned and used internally to represent a tcp client connection.
+ */
+struct TcpClient {
     int fd;
-    union {
-        on_accept_t on_accept;
-    } callback;
+    std::uint32_t generation;
 };
 
-enum class WatchListItemType : std::uint8_t { Listener };
-
-struct WatchListItem {
-    WatchListItemType type;
-    union {
-        on_accept_t listener; // listener just on_accept callback for now
-    } item;
+/**
+ * @brief Owned and used internally to represent a tcp listener.
+ */
+struct TcpListener {
+    int fd;
+    OnAccept on_accept;
+    OnRead on_read;
+    OnWrite on_write;
+    OnClose on_close;
+    std::uint32_t generation;
 };
+
+/**
+ * @brief Public interface for tcp client, containing a handle to the underlying
+ * representation.
+ */
+struct TcpClientView {
+public:
+    TcpClientView(Handle handle, EventLoop &loop)
+        : handle_(handle), loop_(&loop) {}
+
+private:
+    Handle handle_;
+    EventLoop *loop_;
+};
+
+/**
+ * @brief Public interface for tcp listener, containing a handle to the
+ * underlying representation.
+ */
+struct TcpListenerView {
+public:
+    TcpListenerView(Handle handle, EventLoop &loop)
+        : handle_(handle), loop_(&loop) {}
+
+private:
+    Handle handle_;
+    EventLoop *loop_;
+};
+
+/**
+ * @brief Used internally for passing messages between event loops.
+ */
+struct Message {};
 
 /**
  * @brief The main class, handling the event loop.
  */
 class EventLoop {
 public:
-    EventLoop();
-    explicit EventLoop(int threads);
-    ~EventLoop();
+    EventLoop(int thread_id = 0);
+    ~EventLoop() = default;
+
+    void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
+                    OnAccept on_accept, OnRead on_read, OnWrite on_write,
+                    OnClose on_close);
+    void tcp_connect(std::uint32_t host, std::uint16_t port,
+                     OnConnect on_connect, OnRead on_read, OnWrite on_write,
+                     OnClose on_close);
+    void tcp_write(Handle handle, std::uint8_t *buf, std::size_t size);
+    void tcp_close(Handle handle);
 
     void run();
+    void stop();
 
-    NetworkError tcp_listen(std::uint32_t host, std::uint16_t port,
-                            on_accept_t on_accept);
+    void wake();
 
 private:
-    void thread_loop(int thread_id);
-
     bool is_running_ = false;
-    std::mutex thread_start_mutex_;
-    std::condition_variable thread_start_cv_;
-    std::vector<MPSCQueue<Message>> message_queues_;
-    std::vector<std::thread> threads_;
+
+    IOUring ring_;
+
+    std::vector<TcpClient> tcp_clients_;
+    std::stack<int> tcp_free_clients_;
+    std::vector<TcpListener> tcp_listeners_;
+    std::stack<int> tcp_free_listeners_;
+
+    MPSCQueue<Message> msg_queue_;
+    int wake_fd_;
+    int wake_buf_;
+    int thread_id_;
+
+    TcpClientView create_client(int fd);
+    void handle_cqe(io_uring_cqe *cqe);
+    void handle_accept(Handle handle, int result, std::uint32_t flags);
+
+    NetworkError do_tcp_listen(std::uint32_t host, std::uint16_t port,
+                               TcpListenerView &listener, OnAccept on_accept,
+                               OnRead on_read, OnWrite on_write,
+                               OnClose on_close);
 };
 
 inline std::uint32_t ipv4_address(std::uint8_t one, std::uint8_t two,

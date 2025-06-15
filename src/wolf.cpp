@@ -1,70 +1,68 @@
-#include <wolf.h>
-
-#include <cerrno>
-#include <condition_variable>
-#include <cstddef>
-#include <cstring>
-#include <mutex>
-#include <stdexcept>
-#include <vector>
-
 #include <arpa/inet.h>
 #include <linux/io_uring.h>
-#include <netinet/in.h>
+#include <stdexcept>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 
-#include <iouring.h>
-#include <mpsc_queue.h>
+#include <wolf.h>
 
-namespace wolf {
+namespace /* internals */ {
 
-static constexpr std::size_t MAX_DATA_TRANSFER = 65535;
-static constexpr std::uint32_t RING_ENTRIES_HINT = 1024;
-static constexpr std::uint32_t LISTEN_BACKLOG = 4096;
+/* handle format: Op(4)|THREAD_ID(6)|INDEX(22)|GENERATION(32) */
+enum class Op : std::uint8_t { TcpAccept, Wake };
 
-/**
- * @brief Initialises the event loop threads
- *
- * @param threads Number of threads to use
- */
-EventLoop::EventLoop(int threads) {
-    for (int i = 0; i < threads; i++) {
-        message_queues_.emplace_back(eventfd(1, 0));
-        threads_.emplace_back(&EventLoop::thread_loop, this, i);
-    }
+constexpr int OP_BITS = 4;
+constexpr int THREAD_ID_BITS = 6;
+constexpr int INDEX_BITS = 22;
+constexpr int GENERATION_BITS = 32;
+
+constexpr int OP_SHIFT = GENERATION_BITS + INDEX_BITS + THREAD_ID_BITS;
+constexpr int THREAD_ID_SHIFT = GENERATION_BITS + INDEX_BITS;
+constexpr int INDEX_SHIFT = GENERATION_BITS;
+constexpr int GENERATION_SHIFT = 0;
+
+constexpr std::uint64_t THREAD_ID_MASK = ((1LLU << THREAD_ID_BITS) - 1)
+                                         << THREAD_ID_SHIFT;
+constexpr std::uint64_t INDEX_MASK = ((1LLU << INDEX_BITS) - 1) << INDEX_SHIFT;
+
+static_assert(OP_BITS + THREAD_ID_BITS + INDEX_BITS + GENERATION_BITS == 64,
+              "handle parts must sum to 64 bits");
+
+constexpr inline std::uint64_t make_handle(int thread_id, int index,
+                                           std::uint32_t generation) {
+    return (std::uint64_t(thread_id) << THREAD_ID_SHIFT) |
+           (std::uint64_t(index) << INDEX_SHIFT) | std::uint64_t(generation);
 }
 
-/**
- * @brief Initialises the event loop, using std::thread::hardware_concurrnecy number of threads
- */
-EventLoop::EventLoop() {
-    for (int i = 0; i < std::thread::hardware_concurrency(); i++) {
-        message_queues_.emplace_back(eventfd(1, 0));
-        threads_.emplace_back(&EventLoop::thread_loop, this, i);
-    }
+constexpr inline std::uint64_t add_operation(std::uint64_t handle, Op op) {
+    return handle | (std::uint64_t(op) << OP_SHIFT);
 }
 
-EventLoop::~EventLoop() = default;
-
-/**
- * @brief Starts the event loop by signalling all threads to run.
- */
-void EventLoop::run() {
-    {
-        std::lock_guard start_lock(thread_start_mutex_);
-        is_running_ = true;
-    }
-    thread_start_cv_.notify_all();
-
-    for (int i = 0; i < threads_.size(); i++) {
-        threads_[i].join();
-    }
+constexpr inline Op get_operation(std::uint64_t handle) {
+    return Op(handle >> OP_SHIFT);
 }
 
-static NetworkError create_listening_socket(std::uint32_t host,
-                                            std::uint16_t port,
-                                            int &socket_fd) {
+constexpr inline int get_thread_id(std::uint64_t handle) {
+    return (handle & THREAD_ID_MASK) >> THREAD_ID_SHIFT;
+}
+
+constexpr inline int get_index(std::uint64_t handle) {
+    return (handle & INDEX_MASK) >> INDEX_SHIFT;
+}
+
+constexpr inline std::uint32_t get_generation(std::uint64_t handle) {
+    return handle >> INDEX_SHIFT;
+}
+
+thread_local wolf::EventLoop *thread_loop = nullptr;
+
+constexpr std::uint32_t RING_ENTRIES_HINT = 1024;
+constexpr std::uint32_t LISTEN_BACKLOG = 4096;
+
+wolf::NetworkError create_listening_socket(std::uint32_t host,
+                                           std::uint16_t port, int &socket_fd) {
+    using wolf::NetworkError;
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         switch (errno) {
@@ -124,131 +122,153 @@ static NetworkError create_listening_socket(std::uint32_t host,
     return NetworkError::Ok;
 }
 
-/**
- * @brief Creates a socket and starts listening.
- */
-NetworkError EventLoop::tcp_listen(std::uint32_t host, std::uint16_t port,
-                                   on_accept_t on_accept) {
-    std::vector<int> sockets;
-    for (int i = 0; i < threads_.size(); i++) {
-        int fd;
-        NetworkError err = create_listening_socket(host, port, fd);
-        if (err != NetworkError::Ok) {
-            for (int f : sockets) {
-                close(f);
-            }
-            return err;
-        }
-        sockets.push_back(fd);
+} // namespace
+
+namespace wolf {
+
+EventLoop::EventLoop(int thread_id)
+    : ring_(RING_ENTRIES_HINT), wake_fd_(eventfd(1, 0)), thread_id_(thread_id),
+      tcp_clients_(10), tcp_listeners_(1) {
+    // add indexes to free list
+    for (int i = 0; i < tcp_clients_.size(); i++) {
+        tcp_free_clients_.push(i);
     }
 
-    for (int i = 0; i < threads_.size(); i++) {
-        message_queues_[i].push({.op = MessageOperation::AttachListener,
-                                 .fd = sockets[i],
-                                 .callback = {.on_accept = on_accept}});
+    for (int i = 0; i < tcp_listeners_.size(); i++) {
+        tcp_free_listeners_.push(i);
     }
+}
+
+void EventLoop::tcp_listen(std::uint32_t host, std::uint16_t port,
+                           OnListen on_listen, OnAccept on_accept,
+                           OnRead on_read, OnWrite on_write, OnClose on_close) {
+    if (thread_loop == this) {
+        TcpListenerView listener(0, *this);
+        NetworkError err = do_tcp_listen(host, port, listener, on_accept,
+                                         on_read, on_write, on_close);
+        on_listen(*this, listener, err);
+    } else {
+        // TODO
+        throw std::runtime_error("Not implemented");
+    }
+}
+
+void EventLoop::handle_cqe(io_uring_cqe *cqe) {
+    std::uint64_t handle = cqe->user_data;
+
+    switch (get_operation(handle)) {
+    case Op::TcpAccept:
+        handle_accept(cqe->user_data, cqe->res, cqe->flags);
+        break;
+
+    case Op::Wake:
+        break;
+    }
+}
+
+TcpClientView EventLoop::create_client(int fd) {
+    if (tcp_free_clients_.empty()) {
+        int size = tcp_clients_.size();
+        tcp_clients_.resize(tcp_clients_.size() * 2);
+        for (int i = (size * 2) - 1; i >= size; i--) {
+            tcp_free_clients_.push(i);
+        }
+    }
+
+    int index = tcp_free_clients_.top();
+    tcp_free_clients_.pop();
+
+    tcp_clients_[index].fd = fd;
+    tcp_clients_[index].generation++;
+
+    TcpClientView client_view(
+        make_handle(thread_id_, index, tcp_clients_[index].generation), *this);
+
+    return client_view;
+}
+
+void EventLoop::handle_accept(std::uint64_t handle, int result,
+                              std::uint32_t flags) {
+    int index = get_index(handle);
+    if (result >= 0) {
+        TcpClientView client_view = create_client(result);
+        tcp_listeners_[index].on_accept(*this, client_view, NetworkError::Ok);
+    } else {
+        // TODO: more specific errors
+        TcpClientView client_view(0, *this);
+        tcp_listeners_[index].on_accept(*this, client_view,
+                                        NetworkError::Unknown);
+    }
+}
+
+NetworkError EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port,
+                                      TcpListenerView &listener,
+                                      OnAccept on_accept, OnRead on_read,
+                                      OnWrite on_write, OnClose on_close) {
+    int fd;
+    NetworkError err = create_listening_socket(host, port, fd);
+
+    if (err != NetworkError::Ok) {
+        return err;
+    }
+
+    if (tcp_free_listeners_.empty()) {
+        int size = tcp_listeners_.size();
+        tcp_listeners_.resize(tcp_listeners_.size() * 2);
+        for (int i = (size * 2) - 1; i >= size; i--) {
+            tcp_free_listeners_.push(i);
+        }
+    }
+
+    int index = tcp_free_listeners_.top();
+    tcp_free_listeners_.pop();
+
+    tcp_listeners_[index].generation++;
+    tcp_listeners_[index].fd = fd;
+    tcp_listeners_[index].on_accept = on_accept;
+    tcp_listeners_[index].on_read = on_read;
+    tcp_listeners_[index].on_write = on_write;
+    tcp_listeners_[index].on_close = on_close;
+
+    std::uint64_t handle =
+        make_handle(thread_id_, index, tcp_listeners_[index].generation);
+    listener = TcpListenerView(handle, *this);
+
+    // post accept sqe
+    ring_.sq_push(
+        io_uring_sqe{.opcode = IORING_OP_ACCEPT,
+                     .ioprio = IORING_ACCEPT_MULTISHOT,
+                     .fd = fd,
+                     .user_data = add_operation(handle, Op::TcpAccept)});
+
     return NetworkError::Ok;
 }
 
-/**
- * @brief Helper function to add an item to the watch list, making sure there is
- * enough space.
- */
-void watch_list_push(std::vector<WatchListItem> &watch_list, WatchListItem item,
-                     int fd) {
-    if (watch_list.size() <= fd) {
-        watch_list.resize(fd + 1);
-    }
-    watch_list[fd] = item;
-}
+void EventLoop::run() {
+    thread_loop = this;
+    is_running_ = true;
 
-/**
- * @brief Loops through the message queue and handles all messages.
- */
-static void handle_messages(IOUring &ring,
-                            std::vector<WatchListItem> &watch_list,
-                            MPSCQueue<Message> &message_queue,
-                            const std::uint64_t *wake_buf) {
-    std::vector<Message> messages = message_queue.drain();
-    for (Message &msg : messages) {
-        switch (msg.op) {
-        case MessageOperation::AttachListener:
-            // Multishot kernel >= 6.0
-            ring.sq_push(
-                io_uring_sqe{.opcode = IORING_OP_ACCEPT,
-                             .ioprio = IORING_ACCEPT_MULTISHOT,
-                             .fd = msg.fd,
-                             .user_data = static_cast<std::uint64_t>(msg.fd)});
-
-            watch_list_push(
-                watch_list,
-                WatchListItem{.type = WatchListItemType::Listener,
-                              .item = {.listener = msg.callback.on_accept}},
-                msg.fd);
-            break;
-        }
-    }
-
-    // rearm
-    ring.sq_push({.opcode = IORING_OP_READ,
-                  .fd = message_queue.wake_fd(),
-                  .addr = std::bit_cast<std::uint64_t>(&wake_buf),
-                  .len = sizeof(wake_buf),
-                  .user_data = (std::uint64_t)message_queue.wake_fd()});
-}
-
-/**
- * @brief The main loop run by each worker thread.
- */
-void EventLoop::thread_loop(int thread_id) {
-    {
-        std::unique_lock start_lock(thread_start_mutex_);
-        thread_start_cv_.wait(start_lock, [&] { return is_running_; });
-    }
-
-    IOUring ring(RING_ENTRIES_HINT);
-    std::vector<WatchListItem> watch_list;
-    MPSCQueue<Message> &message_queue = message_queues_[thread_id];
-
-    // Setup wake eventfd
-    std::uint64_t wake_buf;
-    ring.sq_start_push();
-    ring.sq_push({.opcode = IORING_OP_READ,
-                  .fd = message_queue.wake_fd(),
-                  .addr = std::bit_cast<std::uint64_t>(&wake_buf),
-                  .len = sizeof(wake_buf),
-                  .user_data = (std::uint64_t)message_queue.wake_fd()});
-    ring.sq_end_push();
+    // arm eventfd wake
+    ring_.sq_start_push();
+    // Kernel >= 6.7
+    ring_.sq_push({.opcode = IORING_OP_READ_MULTISHOT,
+                   .fd = wake_fd_,
+                   .addr = std::bit_cast<std::uint64_t>(&wake_buf_),
+                   .len = sizeof(wake_buf_),
+                   .user_data = add_operation(0, Op::Wake)});
+    ring_.sq_end_push();
 
     while (is_running_) {
-        int ret = ring.enter();
-        if (ret < 0) {
-            throw std::runtime_error(
-                std::format("iouring: enter failed. Got {}", strerror(ret)));
+        ring_.enter();
+
+        ring_.cq_start_pop();
+        ring_.sq_start_push();
+        io_uring_cqe *cqe;
+        while ((cqe = ring_.cq_pop()) != nullptr) {
+            handle_cqe(cqe);
         }
-
-        ring.sq_start_push();
-        ring.cq_start_pop();
-        while (io_uring_cqe *cqe = ring.cq_pop()) {
-            if (cqe->user_data == message_queue.wake_fd()) {
-                handle_messages(ring, watch_list, message_queue, &wake_buf);
-                continue;
-            }
-
-            int fd = static_cast<int>(cqe->user_data);
-            WatchListItem &item = watch_list[fd];
-            if (item.type == WatchListItemType::Listener) {
-                item.item.listener();
-
-                // TODO: handle accept cqe properly
-                if (cqe->res < 0) {
-                    throw std::runtime_error(std::format(
-                        "got err accepting: {}", strerror(-cqe->res)));
-                }
-            }
-        }
-        ring.cq_end_pop();
-        ring.sq_end_push();
+        ring_.sq_end_push();
+        ring_.cq_end_pop();
     }
 }
 
