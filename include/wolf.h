@@ -8,6 +8,8 @@
 #include <iouring.h>
 #include <mpsc_queue.h>
 
+static constexpr int CLIENT_READ_BUFFER_SIZE = 4096;
+
 namespace wolf {
 
 // Forward declarations
@@ -20,7 +22,7 @@ enum class NetworkError;
 using OnListen = void (*)(EventLoop &, TcpListenerView, NetworkError err);
 using OnAccept = void (*)(EventLoop &, TcpClientView, NetworkError err);
 using OnConnect = void (*)(void);
-using OnRead = void (*)(void);
+using OnRead = void (*)(EventLoop &, TcpClientView, std::uint8_t *buf, std::size_t size, NetworkError err);
 using OnWrite = void (*)(void);
 using OnClose = void (*)(void);
 
@@ -44,6 +46,10 @@ enum class NetworkError {
 struct TcpClient {
     int fd;
     std::uint32_t generation;
+    OnRead on_read;
+    OnWrite on_write;
+    OnClose on_close;
+    alignas(64) std::uint8_t read_buf[CLIENT_READ_BUFFER_SIZE];
 };
 
 /**
@@ -149,10 +155,11 @@ private:
     std::uint64_t wake_buf_;
     int thread_id_;
 
-    TcpClientView create_client(int fd);
+    TcpClientView create_client(int fd, OnRead on_read, OnWrite on_write, OnClose on_close);
     void handle_cqe(io_uring_cqe *cqe);
     void handle_messages();
     void handle_accept(Handle handle, int result, std::uint32_t flags);
+    void handle_read(Handle handle, int result, std::uint32_t flags);
 
     void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept,
                                OnRead on_read, OnWrite on_write,
