@@ -8,8 +8,6 @@
 #include <iouring.h>
 #include <mpsc_queue.h>
 
-static constexpr int CLIENT_READ_BUFFER_SIZE = 4096;
-
 namespace wolf {
 
 // Forward declarations
@@ -22,7 +20,8 @@ enum class NetworkError;
 using OnListen = void (*)(EventLoop &, TcpListenerView, NetworkError err);
 using OnAccept = void (*)(EventLoop &, TcpClientView, NetworkError err);
 using OnConnect = void (*)(void);
-using OnRead = void (*)(EventLoop &, TcpClientView, std::uint8_t *buf, std::size_t size, NetworkError err);
+using OnRead = void (*)(EventLoop &, TcpClientView, std::uint8_t *buf, std::size_t size,
+                        NetworkError err);
 using OnWrite = void (*)(void);
 using OnClose = void (*)(void);
 
@@ -31,14 +30,7 @@ using Handle = std::uint64_t;
 /**
  * @brief Errors that can arise during networking.
  */
-enum class NetworkError {
-    Ok,
-    PermissionDenied,
-    LimitReached,
-    NoMemory,
-    AddressInUse,
-    Unknown
-};
+enum class NetworkError { Ok, PermissionDenied, LimitReached, NoMemory, AddressInUse, Unknown };
 
 /**
  * @brief Owned and used internally to represent a tcp client connection.
@@ -49,7 +41,7 @@ struct TcpClient {
     OnRead on_read;
     OnWrite on_write;
     OnClose on_close;
-    alignas(64) std::uint8_t read_buf[CLIENT_READ_BUFFER_SIZE];
+    std::uint8_t *read_buf;
 };
 
 /**
@@ -70,8 +62,7 @@ struct TcpListener {
  */
 struct TcpClientView {
 public:
-    TcpClientView(Handle handle, EventLoop &loop)
-        : handle_(handle), loop_(&loop) {}
+    TcpClientView(Handle handle, EventLoop &loop) : handle_(handle), loop_(&loop) {}
 
 private:
     Handle handle_;
@@ -84,17 +75,14 @@ private:
  */
 struct TcpListenerView {
 public:
-    TcpListenerView(Handle handle, EventLoop &loop)
-        : handle_(handle), loop_(&loop) {}
+    TcpListenerView(Handle handle, EventLoop &loop) : handle_(handle), loop_(&loop) {}
 
 private:
     Handle handle_;
     EventLoop *loop_;
 };
 
-enum class MessageType : std::uint8_t {
-    CreateListener
-};
+enum class MessageType : std::uint8_t { CreateListener };
 
 struct CreateListenerMessage {
     std::uint32_t host;
@@ -116,6 +104,58 @@ struct Message {
     MessageType type;
 };
 
+constexpr std::size_t READ_BUF_SIZE = 4096;
+
+/**
+ * @internal
+ * @brief Allocator used for client read buffers.
+ */
+class BufferAllocator {
+    static constexpr std::size_t INITIAL_SIZE = 16;
+    static_assert(READ_BUF_SIZE % 64 == 0);
+
+public:
+    BufferAllocator() { do_chunk_alloc(); }
+
+    ~BufferAllocator() {
+        for (std::uint8_t *p : allocations_) {
+            std::free(p);
+        }
+    }
+
+    std::uint8_t *alloc() {
+        if (free_list_.empty()) {
+            do_chunk_alloc();
+        }
+        std::uint8_t *ptr = free_list_.back();
+        free_list_.pop_back();
+        return ptr;
+    }
+
+    void free(std::uint8_t *ptr) { free_list_.push_back(ptr); }
+
+private:
+    void do_chunk_alloc() {
+        std::uint8_t *ptr = static_cast<std::uint8_t *>(
+            std::aligned_alloc(64, current_alloc_size_ * READ_BUF_SIZE));
+
+        if (!ptr) {
+            throw std::bad_alloc();
+        }
+
+        for (std::uint8_t *p = ptr; p < ptr + (current_alloc_size_ * READ_BUF_SIZE);
+             p += READ_BUF_SIZE) {
+            free_list_.push_back(p);
+        }
+        allocations_.push_back(ptr);
+        current_alloc_size_ *= 2;
+    }
+
+    std::vector<std::uint8_t *> free_list_;
+    std::vector<std::uint8_t *> allocations_;
+    std::size_t current_alloc_size_ = INITIAL_SIZE;
+};
+
 /**
  * @brief The main class, handling the event loop.
  */
@@ -126,12 +166,10 @@ public:
 
     void post(Message msg);
 
-    void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
-                    OnAccept on_accept, OnRead on_read, OnWrite on_write,
-                    OnClose on_close);
-    void tcp_connect(std::uint32_t host, std::uint16_t port,
-                     OnConnect on_connect, OnRead on_read, OnWrite on_write,
-                     OnClose on_close);
+    void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept,
+                    OnRead on_read, OnWrite on_write, OnClose on_close);
+    void tcp_connect(std::uint32_t host, std::uint16_t port, OnConnect on_connect, OnRead on_read,
+                     OnWrite on_write, OnClose on_close);
     void tcp_write(Handle handle, std::uint8_t *buf, std::size_t size);
     void tcp_close(Handle handle);
 
@@ -150,6 +188,8 @@ private:
     std::vector<TcpListener> tcp_listeners_;
     std::stack<int> tcp_free_listeners_;
 
+    BufferAllocator buffer_allocator_;
+
     MPSCQueue<Message> msg_queue_;
     int wake_fd_;
     std::uint64_t wake_buf_;
@@ -161,13 +201,12 @@ private:
     void handle_accept(Handle handle, int result, std::uint32_t flags);
     void handle_read(Handle handle, int result, std::uint32_t flags);
 
-    void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept,
-                               OnRead on_read, OnWrite on_write,
-                               OnClose on_close);
+    void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
+                       OnAccept on_accept, OnRead on_read, OnWrite on_write, OnClose on_close);
 };
 
-inline std::uint32_t ipv4_address(std::uint8_t one, std::uint8_t two,
-                                  std::uint8_t three, std::uint8_t four) {
+inline std::uint32_t ipv4_address(std::uint8_t one, std::uint8_t two, std::uint8_t three,
+                                  std::uint8_t four) {
     return (one << 24) | (two << 16) | (three << 8) | four;
 }
 

@@ -45,9 +45,7 @@ constexpr inline int get_index(std::uint64_t handle) {
     return (handle & INDEX_MASK) >> INDEX_SHIFT;
 }
 
-constexpr inline std::uint32_t get_generation(std::uint64_t handle) {
-    return handle;
-}
+constexpr inline std::uint32_t get_generation(std::uint64_t handle) { return handle; }
 
 thread_local wolf::EventLoop *thread_loop = nullptr;
 
@@ -205,13 +203,14 @@ TcpClientView EventLoop::create_client(int fd, OnRead on_read, OnWrite on_write,
     tcp_clients_[index].on_read = on_read;
     tcp_clients_[index].on_write = on_write;
     tcp_clients_[index].on_close = on_close;
+    tcp_clients_[index].read_buf = buffer_allocator_.alloc();
 
     std::uint64_t handle = make_handle(thread_id_, index, tcp_clients_[index].generation);
     TcpClientView client_view(handle, *this);
 
     ring_.sq_push({.opcode = IORING_OP_READ,
                    .fd = fd,
-                   .addr = std::bit_cast<std::uint64_t>(&tcp_clients_[index].read_buf),
+                   .addr = std::bit_cast<std::uint64_t>(tcp_clients_[index].read_buf),
                    .len = sizeof(tcp_clients_[index].read_buf),
                    .user_data = add_operation(handle, Op::TcpRead)});
 
@@ -252,10 +251,10 @@ void EventLoop::handle_read(std::uint64_t handle, int result, std::uint32_t flag
 
     client.on_read(*this, TcpClientView(handle, *this), client.read_buf, result, NetworkError::Ok);
     ring_.sq_push({.opcode = IORING_OP_READ,
-                    .fd = client.fd,
-                    .addr = std::bit_cast<std::uint64_t>(&client.read_buf),
-                    .len = sizeof(client.read_buf),
-                    .user_data = add_operation(handle, Op::TcpRead)});
+                   .fd = client.fd,
+                   .addr = std::bit_cast<std::uint64_t>(client.read_buf),
+                   .len = sizeof(client.read_buf),
+                   .user_data = add_operation(handle, Op::TcpRead)});
 }
 
 void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
