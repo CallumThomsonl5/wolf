@@ -2,7 +2,6 @@
 #define WOLF_H_INCLUDED
 
 #include <cstdint>
-#include <stack>
 #include <vector>
 
 #include <iouring.h>
@@ -184,9 +183,9 @@ private:
     IOUring ring_;
 
     std::vector<TcpClient> tcp_clients_;
-    std::stack<int> tcp_free_clients_;
+    std::vector<int> tcp_free_clients_;
     std::vector<TcpListener> tcp_listeners_;
-    std::stack<int> tcp_free_listeners_;
+    std::vector<int> tcp_free_listeners_;
 
     BufferAllocator buffer_allocator_;
 

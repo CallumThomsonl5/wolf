@@ -121,11 +121,11 @@ EventLoop::EventLoop(int thread_id)
       tcp_listeners_(1) {
     // add indexes to free list
     for (int i = 0; i < tcp_clients_.size(); i++) {
-        tcp_free_clients_.push(i);
+        tcp_free_clients_.push_back(i);
     }
 
     for (int i = 0; i < tcp_listeners_.size(); i++) {
-        tcp_free_listeners_.push(i);
+        tcp_free_listeners_.push_back(i);
     }
 }
 
@@ -191,12 +191,12 @@ TcpClientView EventLoop::create_client(int fd, OnRead on_read, OnWrite on_write,
         int size = tcp_clients_.size();
         tcp_clients_.resize(tcp_clients_.size() * 2);
         for (int i = (size * 2) - 1; i >= size; i--) {
-            tcp_free_clients_.push(i);
+            tcp_free_clients_.push_back(i);
         }
     }
 
-    int index = tcp_free_clients_.top();
-    tcp_free_clients_.pop();
+    int index = tcp_free_clients_.back();
+    tcp_free_clients_.pop_back();
 
     tcp_clients_[index].fd = fd;
     tcp_clients_[index].generation++;
@@ -273,12 +273,12 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
         int size = tcp_listeners_.size();
         tcp_listeners_.resize(tcp_listeners_.size() * 2);
         for (int i = (size * 2) - 1; i >= size; i--) {
-            tcp_free_listeners_.push(i);
+            tcp_free_listeners_.push_back(i);
         }
     }
 
-    int index = tcp_free_listeners_.top();
-    tcp_free_listeners_.pop();
+    int index = tcp_free_listeners_.back();
+    tcp_free_listeners_.pop_back();
 
     tcp_listeners_[index].generation++;
     tcp_listeners_[index].fd = fd;
@@ -325,6 +325,8 @@ void EventLoop::run() {
         ring_.sq_end_push();
         ring_.cq_end_pop();
     }
+
+    thread_loop = nullptr;
 }
 
 } // namespace wolf
