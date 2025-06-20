@@ -131,6 +131,15 @@ void TcpClientView::write(std::uint8_t *buf, std::uint32_t size) {
     }
 }
 
+void TcpClientView::set_context(void *context) {
+    if (thread_loop == loop_) {
+        loop_->do_set_context(handle_, context);
+    } else {
+        loop_->post({.msg = {.set_context{.context = context, .handle = handle_}},
+                     .type = MessageType::SetContext});
+    }
+}
+
 EventLoop::EventLoop(int thread_id)
     : ring_(RING_ENTRIES_HINT), wake_fd_(eventfd(1, 0)), thread_id_(thread_id), tcp_clients_(10),
       tcp_listeners_(1) {
@@ -199,6 +208,10 @@ void EventLoop::handle_messages() {
             WriteMessage &msg = m.msg.write;
             do_tcp_write(msg.handle, msg.buf, msg.size);
         } break;
+        case MessageType::SetContext: {
+            SetContextMessage &msg = m.msg.set_context;
+            do_set_context(msg.handle, msg.context);
+        } break;
         }
     }
     ring_.sq_push({.opcode = IORING_OP_READ,
@@ -244,11 +257,11 @@ void EventLoop::handle_accept(std::uint64_t handle, int result, std::uint32_t fl
     if (result >= 0) {
         TcpClientView client_view =
             create_client(result, listener.on_read, listener.on_write, listener.on_close);
-        listener.on_accept(*this, client_view, NetworkError::Ok);
+        listener.on_accept(client_view, NetworkError::Ok);
     } else {
         // TODO: more specific errors
         TcpClientView client_view(0, *this);
-        listener.on_accept(*this, client_view, NetworkError::Unknown);
+        listener.on_accept(client_view, NetworkError::Unknown);
     }
 }
 
@@ -262,16 +275,19 @@ void EventLoop::handle_read(std::uint64_t handle, int result, std::uint32_t flag
 
     // TODO: deal with result <= 0
     if (result == 0) {
-        client.on_read(*this, TcpClientView(handle, *this), nullptr, 0, NetworkError::Unknown);
+        client.on_read(TcpClientView(remove_operation(handle), *this), nullptr, 0, client.context,
+                       NetworkError::Unknown);
         return;
     }
 
     if (result < 0) {
-        client.on_read(*this, TcpClientView(handle, *this), nullptr, 0, NetworkError::Unknown);
+        client.on_read(TcpClientView(remove_operation(handle), *this), nullptr, 0, client.context,
+                       NetworkError::Unknown);
         return;
     }
 
-    client.on_read(*this, TcpClientView(handle, *this), client.read_buf, result, NetworkError::Ok);
+    client.on_read(TcpClientView(handle, *this), client.read_buf, result, client.context,
+                   NetworkError::Ok);
     ring_.sq_push({.opcode = IORING_OP_READ,
                    .fd = client.fd,
                    .addr = std::bit_cast<std::uint64_t>(client.read_buf),
@@ -296,7 +312,7 @@ void EventLoop::handle_write(std::uint64_t handle, int result, std::uint32_t fla
         write.buf += result;
         write.size -= result;
     } else {
-        client.on_write(*this, TcpClientView(remove_operation(handle), *this), write.cookie,
+        client.on_write(TcpClientView(remove_operation(handle), *this), write.cookie,
                         client.context, NetworkError::Ok);
         client.write_queue.pop_front();
     }
@@ -318,7 +334,7 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
     TcpListenerView listener(0, *this);
 
     if (err != NetworkError::Ok) {
-        on_listen(*this, listener, err);
+        on_listen(listener, err);
         return;
     }
 
@@ -349,7 +365,7 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
                                .fd = fd,
                                .user_data = add_operation(handle, Op::TcpAccept)});
 
-    on_listen(*this, listener, err);
+    on_listen(listener, err);
 }
 
 void EventLoop::do_tcp_write(std::uint64_t handle, std::uint8_t *buf, std::uint32_t size) {
@@ -369,6 +385,11 @@ void EventLoop::do_tcp_write(std::uint64_t handle, std::uint8_t *buf, std::uint3
                                    .len = std::min(MAX_WRITE_SIZE, size),
                                    .user_data = add_operation(handle, Op::TcpWrite)});
     }
+}
+
+void EventLoop::do_set_context(std::uint64_t handle, void *context) {
+    // TODO: check generation etc
+    tcp_clients_[get_index(handle)].context = context;
 }
 
 void EventLoop::run() {

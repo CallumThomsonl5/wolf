@@ -17,12 +17,12 @@ class TcpListenerView;
 enum class NetworkError;
 
 // TODO: Come up with the real function signatures
-using OnListen = void (*)(EventLoop &, TcpListenerView, NetworkError err);
-using OnAccept = void (*)(EventLoop &, TcpClientView, NetworkError err);
+using OnListen = void (*)(TcpListenerView, NetworkError err);
+using OnAccept = void (*)(TcpClientView, NetworkError err);
 using OnConnect = void (*)(void);
-using OnRead = void (*)(EventLoop &, TcpClientView, std::uint8_t *buf, std::size_t size,
+using OnRead = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
                         NetworkError err);
-using OnWrite = void (*)(EventLoop &, TcpClientView, void *cookie, void *context, NetworkError err);
+using OnWrite = void (*)(TcpClientView, void *cookie, void *context, NetworkError err);
 using OnClose = void (*)(void);
 
 using Handle = std::uint64_t;
@@ -73,6 +73,10 @@ public:
 
     void write(std::uint8_t *buf, std::uint32_t size);
 
+    void set_context(void *context);
+
+    EventLoop &loop() { return *loop_; }
+
 private:
     Handle handle_;
     EventLoop *loop_;
@@ -86,12 +90,14 @@ struct TcpListenerView {
 public:
     TcpListenerView(Handle handle, EventLoop &loop) : handle_(handle), loop_(&loop) {}
 
+    EventLoop &loop() { return *loop_; }
+
 private:
     Handle handle_;
     EventLoop *loop_;
 };
 
-enum class MessageType : std::uint8_t { CreateListener, TcpWrite };
+enum class MessageType : std::uint8_t { CreateListener, TcpWrite, SetContext };
 
 struct CreateListenerMessage {
     std::uint32_t host;
@@ -109,6 +115,11 @@ struct WriteMessage {
     std::uint64_t handle;
 };
 
+struct SetContextMessage {
+    void *context;
+    std::uint64_t handle;
+};
+
 /**
  * @brief Used internally for passing messages between event loops.
  */
@@ -116,6 +127,7 @@ struct Message {
     union {
         CreateListenerMessage create_listener;
         WriteMessage write;
+        SetContextMessage set_context;
     } msg;
     MessageType type;
 };
@@ -221,6 +233,7 @@ private:
     void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
                        OnAccept on_accept, OnRead on_read, OnWrite on_write, OnClose on_close);
     void do_tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
+    void do_set_context(Handle handle, void *context);
 
     friend struct TcpClientView;
 };

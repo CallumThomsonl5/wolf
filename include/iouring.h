@@ -69,10 +69,10 @@ public:
 
     bool sq_full() const;
     void sq_push(io_uring_sqe sqe);
-    template <typename Addr, typename UserData>
-        requires(sizeof(UserData) == 8 && sizeof(Addr) == 8)
-    void sq_push(std::uint8_t opcode, int fd, std::uint64_t off, Addr addr,
-                 std::size_t len, std::uint8_t flags, UserData user_data);
+    void sq_push_accept(int fd, std::uint64_t user_data);
+    void sq_push_write(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
+    void sq_push_read(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
+
     void sq_start_push();
     void sq_end_push();
 
@@ -146,6 +146,10 @@ inline IOUring::IOUring(std::uint32_t entries) {
         throw std::runtime_error("io_uring_setup: failed");
     }
     fd_.fd = fd;
+
+    if ((params.features & IORING_FEAT_NODROP) == 0) {
+        throw std::runtime_error("io_uring_setup: no drop not supported");
+    }
 
     sq_size_ = params.sq_entries;
     cq_size_ = params.cq_entries;
@@ -257,26 +261,40 @@ inline void IOUring::sq_push(io_uring_sqe sqe) {
     to_submit_++;
 }
 
-/**
- * @brief Similar to @ref sq_push() but initialises the entry in place.
- *
- * @see sq_push() for more details.
- */
-template <typename Addr, typename UserData>
-    requires(sizeof(UserData) == 8 && sizeof(Addr) == 8)
-inline void IOUring::sq_push(std::uint8_t opcode, int fd, std::uint64_t off,
-                             Addr addr, std::size_t len, std::uint8_t flags,
-                             UserData user_data) {
+inline void IOUring::sq_push_accept(int fd, std::uint64_t user_data) {
     std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {
+        .opcode = IORING_OP_ACCEPT,
+        .ioprio = IORING_ACCEPT_MULTISHOT,
+        .fd = fd,
+        .user_data = user_data
+    };
+    sq_array_[index] = index;
+    to_submit_++;
+}
 
-    sq_sqes_[index].opcode = opcode;
-    sq_sqes_[index].fd = fd;
-    sq_sqes_[index].off = off;
-    sq_sqes_[index].addr = std::bit_cast<std::uint64_t>(addr);
-    sq_sqes_[index].len = len;
-    sq_sqes_[index].flags = flags;
-    sq_sqes_[index].user_data = std::bit_cast<std::uint64_t>(user_data);
+inline void IOUring::sq_push_write(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {
+        .opcode = IORING_OP_WRITE,
+        .fd = fd,
+        .addr = std::bit_cast<std::uint64_t>(buf),
+        .len = size,
+        .user_data = user_data
+    };
+    sq_array_[index] = index;
+    to_submit_++;
+}
 
+inline void IOUring::sq_push_read(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {
+        .opcode = IORING_OP_READ,
+        .fd = fd,
+        .addr = std::bit_cast<std::uint64_t>(buf),
+        .len = size,
+        .user_data = user_data
+    };
     sq_array_[index] = index;
     to_submit_++;
 }

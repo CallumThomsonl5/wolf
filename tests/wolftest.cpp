@@ -5,7 +5,7 @@
 
 #include <wolf.h>
 
-static void on_listen(wolf::EventLoop &loop, wolf::TcpListenerView listener,
+static void on_listen(wolf::TcpListenerView listener,
                       wolf::NetworkError err) {
     if (err != wolf::NetworkError::Ok) {
         std::puts("on listen network error");
@@ -16,7 +16,7 @@ static void on_listen(wolf::EventLoop &loop, wolf::TcpListenerView listener,
 
 const char data[] = "HELLO WORLD";
 
-static void on_accept(wolf::EventLoop &loop, wolf::TcpClientView client,
+static void on_accept(wolf::TcpClientView client,
                       wolf::NetworkError err) {
     static int count = 0;
     if (err != wolf::NetworkError::Ok) {
@@ -27,7 +27,7 @@ static void on_accept(wolf::EventLoop &loop, wolf::TcpClientView client,
     }
 }
 
-static void on_read(wolf::EventLoop &loop, wolf::TcpClientView client, std::uint8_t *buf, std::size_t size, wolf::NetworkError err) {
+static void on_read(wolf::TcpClientView client, std::uint8_t *buf, std::size_t size, void *context, wolf::NetworkError err) {
     static std::atomic<int> count = 0;
     if (err != wolf::NetworkError::Ok) {
         std::cout << "on read error " << ++count << '\n';
@@ -36,7 +36,7 @@ static void on_read(wolf::EventLoop &loop, wolf::TcpClientView client, std::uint
     }
 }
 
-static void on_write(wolf::EventLoop &loop, wolf::TcpClientView client, void *cookie, void *context, wolf::NetworkError err) {
+static void on_write(wolf::TcpClientView client, void *cookie, void *context, wolf::NetworkError err) {
     
 }
 
