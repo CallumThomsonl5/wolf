@@ -14,14 +14,7 @@ static void on_listen(wolf::EventLoop &loop, wolf::TcpListenerView listener,
     }
 }
 
-static void on_listen2(wolf::EventLoop &loop, wolf::TcpListenerView listener,
-                      wolf::NetworkError err) {
-    if (err != wolf::NetworkError::Ok) {
-        std::puts("on listen network error 2");
-    } else {
-        std::puts("started listening 2");
-    }
-}
+const char data[] = "HELLO WORLD";
 
 static void on_accept(wolf::EventLoop &loop, wolf::TcpClientView client,
                       wolf::NetworkError err) {
@@ -30,16 +23,7 @@ static void on_accept(wolf::EventLoop &loop, wolf::TcpClientView client,
         std::puts("on accept network error");
     } else {
         std::cout << "accepted connection " << ++count << '\n';
-    }
-}
-
-static void on_accept2(wolf::EventLoop &loop, wolf::TcpClientView client,
-                      wolf::NetworkError err) {
-    static int count = 0;
-    if (err != wolf::NetworkError::Ok) {
-        std::puts("on accept network error 2");
-    } else {
-        std::cout << "accepted connection 2 " << ++count << '\n';
+        client.write((std::uint8_t*)data, sizeof(data)-1);
     }
 }
 
@@ -52,19 +36,16 @@ static void on_read(wolf::EventLoop &loop, wolf::TcpClientView client, std::uint
     }
 }
 
+static void on_write(wolf::EventLoop &loop, wolf::TcpClientView client, void *cookie, void *context, wolf::NetworkError err) {
+    
+}
+
 int main(void) {
     wolf::EventLoop loop;
-    wolf::EventLoop loop2;
     // use raw address for now until async getaddrinfo is added.
     loop.tcp_listen(wolf::ipv4_address(127, 0, 0, 1), 4444, on_listen,
-                    on_accept, on_read, nullptr, nullptr);
+                    on_accept, on_read, on_write, nullptr);
 
-    std::thread([&]{
-        loop2.tcp_listen(wolf::ipv4_address(127, 0, 0, 1), 4444, on_listen2,
-                    on_accept2, on_read, nullptr, nullptr);
-        loop2.run();
-    }).detach();
-    
     loop.run();
 
     return 0;

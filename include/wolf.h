@@ -2,6 +2,7 @@
 #define WOLF_H_INCLUDED
 
 #include <cstdint>
+#include <deque>
 #include <vector>
 
 #include <iouring.h>
@@ -21,7 +22,7 @@ using OnAccept = void (*)(EventLoop &, TcpClientView, NetworkError err);
 using OnConnect = void (*)(void);
 using OnRead = void (*)(EventLoop &, TcpClientView, std::uint8_t *buf, std::size_t size,
                         NetworkError err);
-using OnWrite = void (*)(void);
+using OnWrite = void (*)(EventLoop &, TcpClientView, void *cookie, void *context, NetworkError err);
 using OnClose = void (*)(void);
 
 using Handle = std::uint64_t;
@@ -35,12 +36,19 @@ enum class NetworkError { Ok, PermissionDenied, LimitReached, NoMemory, AddressI
  * @brief Owned and used internally to represent a tcp client connection.
  */
 struct TcpClient {
+    struct Write {
+        std::uint8_t *buf;
+        std::uint32_t size;
+        void *cookie;
+    };
     int fd;
     std::uint32_t generation;
     OnRead on_read;
     OnWrite on_write;
     OnClose on_close;
     std::uint8_t *read_buf;
+    std::deque<Write> write_queue;
+    void *context;
 };
 
 /**
@@ -63,6 +71,8 @@ struct TcpClientView {
 public:
     TcpClientView(Handle handle, EventLoop &loop) : handle_(handle), loop_(&loop) {}
 
+    void write(std::uint8_t *buf, std::uint32_t size);
+
 private:
     Handle handle_;
     EventLoop *loop_;
@@ -81,7 +91,7 @@ private:
     EventLoop *loop_;
 };
 
-enum class MessageType : std::uint8_t { CreateListener };
+enum class MessageType : std::uint8_t { CreateListener, TcpWrite };
 
 struct CreateListenerMessage {
     std::uint32_t host;
@@ -93,12 +103,19 @@ struct CreateListenerMessage {
     OnClose on_close;
 };
 
+struct WriteMessage {
+    std::uint8_t *buf;
+    std::uint32_t size;
+    std::uint64_t handle;
+};
+
 /**
  * @brief Used internally for passing messages between event loops.
  */
 struct Message {
     union {
         CreateListenerMessage create_listener;
+        WriteMessage write;
     } msg;
     MessageType type;
 };
@@ -169,7 +186,7 @@ public:
                     OnRead on_read, OnWrite on_write, OnClose on_close);
     void tcp_connect(std::uint32_t host, std::uint16_t port, OnConnect on_connect, OnRead on_read,
                      OnWrite on_write, OnClose on_close);
-    void tcp_write(Handle handle, std::uint8_t *buf, std::size_t size);
+    void tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
     void tcp_close(Handle handle);
 
     void run();
@@ -199,9 +216,13 @@ private:
     void handle_messages();
     void handle_accept(Handle handle, int result, std::uint32_t flags);
     void handle_read(Handle handle, int result, std::uint32_t flags);
+    void handle_write(Handle handle, int result, std::uint32_t flags);
 
     void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
                        OnAccept on_accept, OnRead on_read, OnWrite on_write, OnClose on_close);
+    void do_tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
+
+    friend struct TcpClientView;
 };
 
 inline std::uint32_t ipv4_address(std::uint8_t one, std::uint8_t two, std::uint8_t three,

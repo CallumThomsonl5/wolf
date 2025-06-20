@@ -8,7 +8,7 @@
 namespace /* internals */ {
 
 /* handle format: Op(4)|THREAD_ID(6)|INDEX(22)|GENERATION(32) */
-enum class Op : std::uint8_t { TcpAccept, TcpRead, Wake };
+enum class Op : std::uint8_t { TcpAccept, TcpRead, TcpWrite, Wake };
 
 constexpr int OP_BITS = 4;
 constexpr int THREAD_ID_BITS = 6;
@@ -20,6 +20,7 @@ constexpr int THREAD_ID_SHIFT = GENERATION_BITS + INDEX_BITS;
 constexpr int INDEX_SHIFT = GENERATION_BITS;
 constexpr int GENERATION_SHIFT = 0;
 
+constexpr std::uint64_t OP_MASK = ((1LLU << OP_BITS) - 1) << OP_SHIFT;
 constexpr std::uint64_t THREAD_ID_MASK = ((1LLU << THREAD_ID_BITS) - 1) << THREAD_ID_SHIFT;
 constexpr std::uint64_t INDEX_MASK = ((1LLU << INDEX_BITS) - 1) << INDEX_SHIFT;
 
@@ -37,6 +38,10 @@ constexpr inline std::uint64_t add_operation(std::uint64_t handle, Op op) {
 
 constexpr inline Op get_operation(std::uint64_t handle) { return Op(handle >> OP_SHIFT); }
 
+constexpr inline std::uint64_t remove_operation(std::uint64_t handle) {
+    return handle & (~OP_MASK);
+}
+
 constexpr inline int get_thread_id(std::uint64_t handle) {
     return (handle & THREAD_ID_MASK) >> THREAD_ID_SHIFT;
 }
@@ -51,6 +56,7 @@ thread_local wolf::EventLoop *thread_loop = nullptr;
 
 constexpr std::uint32_t LISTEN_BACKLOG = 4096;
 constexpr std::uint32_t RING_ENTRIES_HINT = LISTEN_BACKLOG * 2;
+constexpr std::uint32_t MAX_WRITE_SIZE = 8192;
 
 wolf::NetworkError create_listening_socket(std::uint32_t host, std::uint16_t port, int &socket_fd) {
     using wolf::NetworkError;
@@ -116,6 +122,15 @@ wolf::NetworkError create_listening_socket(std::uint32_t host, std::uint16_t por
 
 namespace wolf {
 
+void TcpClientView::write(std::uint8_t *buf, std::uint32_t size) {
+    if (thread_loop == loop_) {
+        loop_->do_tcp_write(handle_, buf, size);
+    } else {
+        loop_->post({.msg = {.write{.buf = buf, .size = size, .handle = handle_}},
+                     .type = MessageType::TcpWrite});
+    }
+}
+
 EventLoop::EventLoop(int thread_id)
     : ring_(RING_ENTRIES_HINT), wake_fd_(eventfd(1, 0)), thread_id_(thread_id), tcp_clients_(10),
       tcp_listeners_(1) {
@@ -162,6 +177,9 @@ void EventLoop::handle_cqe(io_uring_cqe *cqe) {
     case Op::TcpRead:
         handle_read(cqe->user_data, cqe->res, cqe->flags);
         break;
+    case Op::TcpWrite:
+        handle_write(cqe->user_data, cqe->res, cqe->flags);
+        break;
     case Op::Wake:
         handle_messages();
         break;
@@ -172,11 +190,15 @@ void EventLoop::handle_messages() {
     std::vector<Message> messages = msg_queue_.drain();
     for (Message &m : messages) {
         switch (m.type) {
-        case MessageType::CreateListener:
+        case MessageType::CreateListener: {
             CreateListenerMessage &msg = m.msg.create_listener;
             do_tcp_listen(msg.host, msg.port, msg.on_listen, msg.on_accept, msg.on_read,
                           msg.on_write, msg.on_close);
-            break;
+        } break;
+        case MessageType::TcpWrite: {
+            WriteMessage &msg = m.msg.write;
+            do_tcp_write(msg.handle, msg.buf, msg.size);
+        } break;
         }
     }
     ring_.sq_push({.opcode = IORING_OP_READ,
@@ -211,7 +233,7 @@ TcpClientView EventLoop::create_client(int fd, OnRead on_read, OnWrite on_write,
     ring_.sq_push({.opcode = IORING_OP_READ,
                    .fd = fd,
                    .addr = std::bit_cast<std::uint64_t>(tcp_clients_[index].read_buf),
-                   .len = sizeof(tcp_clients_[index].read_buf),
+                   .len = READ_BUF_SIZE,
                    .user_data = add_operation(handle, Op::TcpRead)});
 
     return client_view;
@@ -253,8 +275,39 @@ void EventLoop::handle_read(std::uint64_t handle, int result, std::uint32_t flag
     ring_.sq_push({.opcode = IORING_OP_READ,
                    .fd = client.fd,
                    .addr = std::bit_cast<std::uint64_t>(client.read_buf),
-                   .len = sizeof(client.read_buf),
+                   .len = READ_BUF_SIZE,
                    .user_data = add_operation(handle, Op::TcpRead)});
+}
+
+void EventLoop::handle_write(std::uint64_t handle, int result, std::uint32_t flags) {
+    TcpClient &client = tcp_clients_[get_index(handle)];
+    if (client.generation != get_generation(handle)) {
+        // stale request
+        return;
+    }
+
+    if (result < 0) {
+        // TODO: deal with this
+        return;
+    }
+
+    TcpClient::Write &write = client.write_queue.front();
+    if (result < write.size) {
+        write.buf += result;
+        write.size -= result;
+    } else {
+        client.on_write(*this, TcpClientView(remove_operation(handle), *this), write.cookie,
+                        client.context, NetworkError::Ok);
+        client.write_queue.pop_front();
+    }
+
+    if (!client.write_queue.empty()) {
+        ring_.sq_push({.opcode = IORING_OP_WRITE,
+                       .fd = client.fd,
+                       .addr = std::bit_cast<std::uint64_t>(client.write_queue.front().buf),
+                       .len = std::min(MAX_WRITE_SIZE, client.write_queue.front().size),
+                       .user_data = add_operation(handle, Op::TcpWrite)});
+    }
 }
 
 void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
@@ -297,6 +350,25 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
                                .user_data = add_operation(handle, Op::TcpAccept)});
 
     on_listen(*this, listener, err);
+}
+
+void EventLoop::do_tcp_write(std::uint64_t handle, std::uint8_t *buf, std::uint32_t size) {
+    TcpClient &client = tcp_clients_[get_index(handle)];
+
+    if (client.generation != get_generation(handle)) {
+        // stale
+        return;
+    }
+
+    client.write_queue.push_back({.buf = buf, .size = size});
+
+    if (!client.write_queue.empty()) {
+        ring_.sq_push(io_uring_sqe{.opcode = IORING_OP_WRITE,
+                                   .fd = client.fd,
+                                   .addr = std::bit_cast<std::uint64_t>(buf),
+                                   .len = std::min(MAX_WRITE_SIZE, size),
+                                   .user_data = add_operation(handle, Op::TcpWrite)});
+    }
 }
 
 void EventLoop::run() {
