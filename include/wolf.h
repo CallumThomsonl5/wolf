@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <linux/io_uring.h>
 #include <vector>
 
 #include <iouring.h>
@@ -210,6 +211,7 @@ private:
     bool is_running_ = false;
 
     IOUring ring_;
+    std::deque<io_uring_sqe> overflow_sqes_;
 
     std::vector<TcpClient> tcp_clients_;
     std::vector<int> tcp_free_clients_;
@@ -234,6 +236,14 @@ private:
                        OnAccept on_accept, OnRead on_read, OnWrite on_write, OnClose on_close);
     void do_tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
     void do_set_context(Handle handle, void *context);
+
+    void push_sqe(io_uring_sqe &&sqe) {
+        if (ring_.sq_full()) {
+            overflow_sqes_.push_back(sqe);
+            return;
+        }
+        ring_.sq_push(sqe);
+    }
 
     friend struct TcpClientView;
 };
