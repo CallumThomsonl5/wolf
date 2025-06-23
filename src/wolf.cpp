@@ -364,6 +364,7 @@ void EventLoop::handle_connect(Handle handle, int result, std::uint32_t flags) {
         pending.on_connect(TcpClientView(0, *this), pending.context, NetworkError::Unknown);
     } else {
         TcpClientView clientview = create_client(pending.fd);
+        clientview.set_context(pending.context);
         pending.on_connect(clientview, pending.context, NetworkError::Ok);
     }
 
@@ -517,23 +518,35 @@ void EventLoop::do_tcp_write(std::uint64_t handle, std::uint8_t *buf, std::uint3
 }
 
 void EventLoop::do_set_context(std::uint64_t handle, void *context) {
-    // TODO: check generation etc
-    tcp_clients_[get_index(handle)].context = context;
+    TcpClient &client = tcp_clients_[get_index(handle)];
+    if (client.generation != get_generation(handle)) {
+        return;
+    }
+    client.context = context;
 }
 
 void EventLoop::do_set_onread(std::uint64_t handle, OnRead on_read) {
-    // TODO: check generation etc
-    tcp_clients_[get_index(handle)].on_read = on_read;
+    TcpClient &client = tcp_clients_[get_index(handle)];
+    if (client.generation != get_generation(handle)) {
+        return;
+    }
+    client.on_read = on_read;
 }
 
 void EventLoop::do_set_onwrite(std::uint64_t handle, OnWrite on_write) {
-    // TODO: check generation etc
-    tcp_clients_[get_index(handle)].on_write = on_write;
+    TcpClient &client = tcp_clients_[get_index(handle)];
+    if (client.generation != get_generation(handle)) {
+        return;
+    }
+    client.on_write = on_write;
 }
 
 void EventLoop::do_set_onclose(std::uint64_t handle, OnClose on_close) {
-    // TODO: check generation etc
-    tcp_clients_[get_index(handle)].on_close = on_close;
+    TcpClient &client = tcp_clients_[get_index(handle)];
+    if (client.generation != get_generation(handle)) {
+        return;
+    }
+    client.on_close = on_close;
 }
 
 void EventLoop::run() {

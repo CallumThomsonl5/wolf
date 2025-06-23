@@ -59,7 +59,7 @@ int main(void) {
     // use raw address for now until async getaddrinfo is added.
     loop.tcp_listen(wolf::ipv4_address(127, 0, 0, 1), 4444, on_listen,
                     on_accept);
-                    
+    
     loop.tcp_connect(wolf::ipv4_address(127, 0, 0, 2), 4444, nullptr, on_connect);
 
     for (int i = 0; i < 11; i++) {
