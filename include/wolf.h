@@ -3,8 +3,10 @@
 
 #include <cstdint>
 #include <deque>
-#include <linux/io_uring.h>
 #include <vector>
+
+#include <linux/io_uring.h>
+#include <netinet/in.h>
 
 #include <iouring.h>
 #include <mpsc_queue.h>
@@ -20,10 +22,10 @@ enum class NetworkError;
 // TODO: Come up with the real function signatures
 using OnListen = void (*)(TcpListenerView, NetworkError err);
 using OnAccept = void (*)(TcpClientView, NetworkError err);
-using OnConnect = void (*)(void);
+using OnConnect = void (*)(TcpClientView, void *context, NetworkError err);
 using OnRead = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
                         NetworkError err);
-using OnWrite = void (*)(TcpClientView, void *cookie, void *context, NetworkError err);
+using OnWrite = void (*)(TcpClientView, void *context, NetworkError err);
 using OnClose = void (*)(void);
 
 using Handle = std::uint64_t;
@@ -40,7 +42,6 @@ struct TcpClient {
     struct Write {
         std::uint8_t *buf;
         std::uint32_t size;
-        void *cookie;
     };
     int fd;
     std::uint32_t generation;
@@ -58,9 +59,6 @@ struct TcpClient {
 struct TcpListener {
     int fd;
     OnAccept on_accept;
-    OnRead on_read;
-    OnWrite on_write;
-    OnClose on_close;
     std::uint32_t generation;
 };
 
@@ -75,6 +73,9 @@ public:
     void write(std::uint8_t *buf, std::uint32_t size);
 
     void set_context(void *context);
+    void set_onread(OnRead on_read);
+    void set_onwrite(OnWrite on_write);
+    void set_onclose(OnClose on_close);
 
     EventLoop &loop() { return *loop_; }
 
@@ -98,16 +99,28 @@ private:
     EventLoop *loop_;
 };
 
-enum class MessageType : std::uint8_t { CreateListener, TcpWrite, SetContext };
+enum class MessageType : std::uint8_t {
+    CreateListener,
+    TcpConnect,
+    TcpWrite,
+    SetContext,
+    SetOnRead,
+    SetOnWrite,
+    SetOnClose
+};
 
 struct CreateListenerMessage {
     std::uint32_t host;
     std::uint16_t port;
     OnListen on_listen;
     OnAccept on_accept;
-    OnRead on_read;
-    OnWrite on_write;
-    OnClose on_close;
+};
+
+struct ConnectMessage {
+    std::uint32_t host;
+    std::uint16_t port;
+    void *context;
+    OnConnect on_connect;
 };
 
 struct WriteMessage {
@@ -121,16 +134,42 @@ struct SetContextMessage {
     std::uint64_t handle;
 };
 
+struct SetOnRead {
+    OnRead on_read;
+    std::uint64_t handle;
+};
+
+struct SetOnWrite {
+    OnWrite on_write;
+    std::uint64_t handle;
+};
+
+struct SetOnClose {
+    OnClose on_close;
+    std::uint64_t handle;
+};
+
 /**
  * @brief Used internally for passing messages between event loops.
  */
 struct Message {
     union {
         CreateListenerMessage create_listener;
+        ConnectMessage connect;
         WriteMessage write;
         SetContextMessage set_context;
+        SetOnRead set_onread;
+        SetOnWrite set_onwrite;
+        SetOnClose set_onclose;
     } msg;
     MessageType type;
+};
+
+struct PendingConnection {
+    int fd;
+    void *context;
+    OnConnect on_connect;
+    struct sockaddr_in sockaddr{};
 };
 
 constexpr std::size_t READ_BUF_SIZE = 4096;
@@ -195,10 +234,8 @@ public:
 
     void post(Message msg);
 
-    void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept,
-                    OnRead on_read, OnWrite on_write, OnClose on_close);
-    void tcp_connect(std::uint32_t host, std::uint16_t port, OnConnect on_connect, OnRead on_read,
-                     OnWrite on_write, OnClose on_close);
+    void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept);
+    void tcp_connect(std::uint32_t host, std::uint16_t port, void *context, OnConnect on_connect);
     void tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
     void tcp_close(Handle handle);
 
@@ -213,6 +250,9 @@ private:
     IOUring ring_;
     std::deque<io_uring_sqe> overflow_sqes_;
 
+    std::vector<PendingConnection> pending_connections_;
+    std::vector<int> free_pending_connections_;
+
     std::vector<TcpClient> tcp_clients_;
     std::vector<int> tcp_free_clients_;
     std::vector<TcpListener> tcp_listeners_;
@@ -225,17 +265,24 @@ private:
     std::uint64_t wake_buf_;
     int thread_id_;
 
-    TcpClientView create_client(int fd, OnRead on_read, OnWrite on_write, OnClose on_close);
+    TcpClientView create_client(int fd);
     void handle_cqe(io_uring_cqe *cqe);
     void handle_messages();
     void handle_accept(Handle handle, int result, std::uint32_t flags);
+    void handle_socket(Handle handle, int result, std::uint32_t flags);
+    void handle_connect(Handle handle, int result, std::uint32_t flags);
     void handle_read(Handle handle, int result, std::uint32_t flags);
     void handle_write(Handle handle, int result, std::uint32_t flags);
 
     void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
-                       OnAccept on_accept, OnRead on_read, OnWrite on_write, OnClose on_close);
+                       OnAccept on_accept);
+    void do_tcp_connect(std::uint32_t host, std::uint16_t port, void *context,
+                        OnConnect on_connect);
     void do_tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
     void do_set_context(Handle handle, void *context);
+    void do_set_onread(Handle handle, OnRead on_read);
+    void do_set_onwrite(Handle handle, OnWrite on_write);
+    void do_set_onclose(Handle handle, OnClose on_close);
 
     void push_sqe(io_uring_sqe &&sqe) {
         if (ring_.sq_full()) {
