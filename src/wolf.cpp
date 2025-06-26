@@ -282,16 +282,8 @@ void EventLoop::handle_messages() {
         }
     }
 
-    if (ring_.sq_full()) {
-        ring_.sq_end_push();
-        ring_.enter();
-        ring_.sq_start_push();
-    }
-    ring_.sq_push({.opcode = IORING_OP_READ,
-                   .fd = wake_fd_,
-                   .addr = std::bit_cast<std::uint64_t>(&wake_buf_),
-                   .len = sizeof(wake_buf_),
-                   .user_data = add_operation(0, Op::Wake)});
+    ring_.sq_push_read(wake_fd_, reinterpret_cast<std::uint8_t *>(&wake_buf_), sizeof(wake_buf_),
+                       add_operation(0, Op::Wake));
 }
 
 TcpClientView EventLoop::create_client(int fd) {
@@ -314,11 +306,8 @@ TcpClientView EventLoop::create_client(int fd) {
     std::uint64_t handle = make_handle(thread_id_, index, tcp_clients_[index].generation);
     TcpClientView client_view(handle, *this);
 
-    push_sqe({.opcode = IORING_OP_READ,
-              .fd = fd,
-              .addr = std::bit_cast<std::uint64_t>(tcp_clients_[index].read_buf),
-              .len = READ_BUF_SIZE,
-              .user_data = add_operation(handle, Op::TcpRead)});
+    ring_.sq_push_read(fd, tcp_clients_[index].read_buf, READ_BUF_SIZE,
+                       add_operation(handle, Op::TcpRead));
 
     return client_view;
 }
@@ -333,9 +322,7 @@ void EventLoop::handle_accept(std::uint64_t handle, int result, std::uint32_t fl
         TcpClientView client_view(0, *this);
         listener.on_accept(client_view, NetworkError::Unknown);
     }
-    push_sqe({.opcode = IORING_OP_ACCEPT,
-              .fd = listener.fd,
-              .user_data = add_operation(handle, Op::TcpAccept)});
+    ring_.sq_push_accept(listener.fd, add_operation(handle, Op::TcpAccept));
 }
 
 void EventLoop::handle_socket(Handle handle, int result, std::uint32_t flags) {
@@ -349,11 +336,9 @@ void EventLoop::handle_socket(Handle handle, int result, std::uint32_t flags) {
     }
 
     pending.fd = result;
-    push_sqe({.opcode = IORING_OP_CONNECT,
-              .fd = result,
-              .off = sizeof(pending.sockaddr),
-              .addr = std::bit_cast<std::uint64_t>(&pending.sockaddr),
-              .user_data = add_operation(remove_operation(handle), Op::TcpConnect)});
+    ring_.sq_push_connect(result, reinterpret_cast<sockaddr *>(&pending.sockaddr),
+                          sizeof(pending.sockaddr),
+                          add_operation(remove_operation(handle), Op::TcpConnect));
 }
 
 void EventLoop::handle_connect(Handle handle, int result, std::uint32_t flags) {
@@ -394,11 +379,9 @@ void EventLoop::handle_read(std::uint64_t handle, int result, std::uint32_t flag
 
     client.on_read(TcpClientView(handle, *this), client.read_buf, result, client.context,
                    NetworkError::Ok);
-    push_sqe({.opcode = IORING_OP_READ,
-              .fd = client.fd,
-              .addr = std::bit_cast<std::uint64_t>(client.read_buf),
-              .len = READ_BUF_SIZE,
-              .user_data = add_operation(handle, Op::TcpRead)});
+
+    ring_.sq_push_read(client.fd, client.read_buf, READ_BUF_SIZE,
+                       add_operation(handle, Op::TcpRead));
 }
 
 void EventLoop::handle_write(std::uint64_t handle, int result, std::uint32_t flags) {
@@ -424,11 +407,8 @@ void EventLoop::handle_write(std::uint64_t handle, int result, std::uint32_t fla
     }
 
     if (!client.write_queue.empty()) {
-        push_sqe({.opcode = IORING_OP_WRITE,
-                  .fd = client.fd,
-                  .addr = std::bit_cast<std::uint64_t>(client.write_queue.front().buf),
-                  .len = std::min(MAX_WRITE_SIZE, client.write_queue.front().size),
-                  .user_data = add_operation(handle, Op::TcpWrite)});
+        ring_.sq_push_write(client.fd, client.write_queue.front().buf,
+                            client.write_queue.front().size, add_operation(handle, Op::TcpWrite));
     }
 }
 
@@ -463,9 +443,7 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
 
     // post accept sqe
     for (int i = 0; i < MAX_ACCEPTS; i++) {
-        push_sqe(io_uring_sqe{.opcode = IORING_OP_ACCEPT,
-                              .fd = fd,
-                              .user_data = add_operation(handle, Op::TcpAccept)});
+        ring_.sq_push_accept(fd, add_operation(handle, Op::TcpAccept));
     }
     on_listen(listener, err);
 }
@@ -491,11 +469,8 @@ void EventLoop::do_tcp_connect(std::uint32_t host, std::uint16_t port, void *con
         .sin_addr = {.s_addr = htonl(host)},
     };
 
-    push_sqe({.opcode = IORING_OP_SOCKET,
-              .fd = AF_INET,
-              .off = SOCK_STREAM,
-              .len = 0,
-              .user_data = add_operation(make_handle(thread_id_, index, 0), Op::TcpSocket)});
+    ring_.sq_push_socket(AF_INET, SOCK_STREAM, 0,
+                         add_operation(make_handle(thread_id_, index, 0), Op::TcpSocket));
 }
 
 void EventLoop::do_tcp_write(std::uint64_t handle, std::uint8_t *buf, std::uint32_t size) {
@@ -509,11 +484,7 @@ void EventLoop::do_tcp_write(std::uint64_t handle, std::uint8_t *buf, std::uint3
     client.write_queue.push_back({.buf = buf, .size = size});
 
     if (!client.write_queue.empty()) {
-        push_sqe(io_uring_sqe{.opcode = IORING_OP_WRITE,
-                              .fd = client.fd,
-                              .addr = std::bit_cast<std::uint64_t>(buf),
-                              .len = std::min(MAX_WRITE_SIZE, size),
-                              .user_data = add_operation(handle, Op::TcpWrite)});
+        ring_.sq_push_write(client.fd, buf, size, add_operation(handle, Op::TcpWrite));
     }
 }
 
@@ -555,11 +526,8 @@ void EventLoop::run() {
 
     // arm eventfd wake
     ring_.sq_start_push();
-    ring_.sq_push({.opcode = IORING_OP_READ,
-                   .fd = wake_fd_,
-                   .addr = std::bit_cast<std::uint64_t>(&wake_buf_),
-                   .len = sizeof(wake_buf_),
-                   .user_data = add_operation(0, Op::Wake)});
+    ring_.sq_push_read(wake_fd_, reinterpret_cast<std::uint8_t *>(wake_buf_), sizeof(wake_buf_),
+                       add_operation(0, Op::Wake));
     ring_.sq_end_push();
 
     while (is_running_) {

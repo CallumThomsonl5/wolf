@@ -284,14 +284,6 @@ private:
     void do_set_onwrite(Handle handle, OnWrite on_write);
     void do_set_onclose(Handle handle, OnClose on_close);
 
-    void push_sqe(io_uring_sqe &&sqe) {
-        if (ring_.sq_full()) {
-            overflow_sqes_.push_back(sqe);
-            return;
-        }
-        ring_.sq_push(sqe);
-    }
-
     friend struct TcpClientView;
 };
 
