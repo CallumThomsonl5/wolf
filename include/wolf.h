@@ -2,7 +2,6 @@
 #define WOLF_H_INCLUDED
 
 #include <cstdint>
-#include <deque>
 #include <vector>
 
 #include <linux/io_uring.h>
@@ -10,6 +9,7 @@
 
 #include <iouring.h>
 #include <mpsc_queue.h>
+#include <ringbuffer.h>
 
 namespace wolf {
 
@@ -49,7 +49,7 @@ struct TcpClient {
     OnWrite on_write;
     OnClose on_close;
     std::uint8_t *read_buf;
-    std::deque<Write> write_queue;
+    RingBuffer<Write> write_queue;
     void *context;
 };
 
@@ -248,7 +248,6 @@ private:
     bool is_running_ = false;
 
     IOUring ring_;
-    std::deque<io_uring_sqe> overflow_sqes_;
 
     std::vector<PendingConnection> pending_connections_;
     std::vector<int> free_pending_connections_;

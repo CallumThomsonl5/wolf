@@ -396,19 +396,19 @@ void EventLoop::handle_write(std::uint64_t handle, int result, std::uint32_t fla
         return;
     }
 
-    TcpClient::Write &write = client.write_queue.front();
+    TcpClient::Write &write = client.write_queue.peek();
     if (result < write.size) {
         write.buf += result;
         write.size -= result;
     } else {
         client.on_write(TcpClientView(remove_operation(handle), *this), client.context,
                         NetworkError::Ok);
-        client.write_queue.pop_front();
+        client.write_queue.pop();
     }
 
     if (!client.write_queue.empty()) {
-        ring_.sq_push_write(client.fd, client.write_queue.front().buf,
-                            client.write_queue.front().size, add_operation(handle, Op::TcpWrite));
+        write = client.write_queue.peek();
+        ring_.sq_push_write(client.fd, write.buf, write.size, add_operation(handle, Op::TcpWrite));
     }
 }
 
@@ -481,7 +481,7 @@ void EventLoop::do_tcp_write(std::uint64_t handle, std::uint8_t *buf, std::uint3
         return;
     }
 
-    client.write_queue.push_back({.buf = buf, .size = size});
+    client.write_queue.push({.buf = buf, .size = size});
 
     if (!client.write_queue.empty()) {
         ring_.sq_push_write(client.fd, buf, size, add_operation(handle, Op::TcpWrite));
@@ -539,11 +539,6 @@ void EventLoop::run() {
         io_uring_cqe *cqe;
         while ((cqe = ring_.cq_pop()) != nullptr) {
             handle_cqe(cqe);
-        }
-
-        while (!ring_.sq_full() && !overflow_sqes_.empty()) {
-            ring_.sq_push(overflow_sqes_.front());
-            overflow_sqes_.pop_front();
         }
 
         ring_.sq_end_push();
