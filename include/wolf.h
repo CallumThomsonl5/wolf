@@ -2,6 +2,7 @@
 #define WOLF_H_INCLUDED
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include <linux/io_uring.h>
@@ -249,7 +250,7 @@ private:
 
     IOUring ring_;
 
-    std::vector<PendingConnection> pending_connections_;
+    std::vector<std::unique_ptr<PendingConnection>> pending_connections_;
     std::vector<int> free_pending_connections_;
 
     std::vector<TcpClient> tcp_clients_;

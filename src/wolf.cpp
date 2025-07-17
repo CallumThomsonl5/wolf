@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <linux/io_uring.h>
+#include <memory>
 #include <netinet/in.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -182,6 +183,7 @@ EventLoop::EventLoop(int thread_id)
     }
 
     for (int i = 0; i < pending_connections_.size(); i++) {
+        pending_connections_[i] = std::make_unique<PendingConnection>();
         free_pending_connections_.push_back(i);
     }
 }
@@ -326,7 +328,7 @@ void EventLoop::handle_accept(std::uint64_t handle, int result, std::uint32_t fl
 }
 
 void EventLoop::handle_socket(Handle handle, int result, std::uint32_t flags) {
-    PendingConnection &pending = pending_connections_[get_index(handle)];
+    PendingConnection &pending = *pending_connections_[get_index(handle)].get();
 
     if (result < 0) {
         // TODO: more detailed error
@@ -342,7 +344,7 @@ void EventLoop::handle_socket(Handle handle, int result, std::uint32_t flags) {
 }
 
 void EventLoop::handle_connect(Handle handle, int result, std::uint32_t flags) {
-    PendingConnection &pending = pending_connections_[get_index(handle)];
+    PendingConnection &pending = *pending_connections_[get_index(handle)].get();
 
     if (result < 0) {
         // TODO: more detailed error
@@ -454,6 +456,7 @@ void EventLoop::do_tcp_connect(std::uint32_t host, std::uint16_t port, void *con
         int size = pending_connections_.size();
         pending_connections_.resize(pending_connections_.size() * 2);
         for (int i = (size * 2) - 1; i >= size; i--) {
+            pending_connections_[i] = std::make_unique<PendingConnection>();
             free_pending_connections_.push_back(i);
         }
     }
@@ -461,9 +464,9 @@ void EventLoop::do_tcp_connect(std::uint32_t host, std::uint16_t port, void *con
     int index = free_pending_connections_.back();
     free_pending_connections_.pop_back();
 
-    pending_connections_[index].context = context;
-    pending_connections_[index].on_connect = on_connect;
-    pending_connections_[index].sockaddr = sockaddr_in{
+    pending_connections_[index]->context = context;
+    pending_connections_[index]->on_connect = on_connect;
+    pending_connections_[index]->sockaddr = sockaddr_in{
         .sin_family = AF_INET,
         .sin_port = htons(port),
         .sin_addr = {.s_addr = htonl(host)},
