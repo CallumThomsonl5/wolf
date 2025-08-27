@@ -24,33 +24,50 @@ enum class NetworkError;
 using OnListen = void (*)(TcpListenerView, NetworkError err);
 using OnAccept = void (*)(TcpClientView, NetworkError err);
 using OnConnect = void (*)(TcpClientView, void *context, NetworkError err);
-using OnRead = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
+using OnRecv = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
                         NetworkError err);
-using OnWrite = void (*)(TcpClientView, void *context, NetworkError err);
-using OnClose = void (*)(void);
+using OnSend = void (*)(TcpClientView, void *context, NetworkError err);
+using OnClose = void (*)(TcpClientView client, void *context, NetworkError err);
 
 using Handle = std::uint64_t;
 
 /**
  * @brief Errors that can arise during networking.
  */
-enum class NetworkError { Ok, PermissionDenied, LimitReached, NoMemory, AddressInUse, Unknown };
+enum class NetworkError { Ok, PermissionDenied, LimitReached, NoMemory, AddressInUse, PeerShutdownWrite, Closed, Unknown };
+
+enum class CloseType {
+    Abort,
+    Graceful
+};
 
 /**
  * @brief Owned and used internally to represent a tcp client connection.
  */
 struct TcpClient {
-    struct Write {
+    struct Send {
         std::uint8_t *buf;
         std::uint32_t size;
     };
+
     int fd;
     std::uint32_t generation;
-    OnRead on_read;
-    OnWrite on_write;
+
+    // State
+    bool recv_pending;
+    bool send_pending;
+    bool read_side_open;
+    bool write_side_open;
+    bool wr_shutdown_sent;
+    bool rdwr_shutdown_sent;
+    bool closing;
+    bool close_sent;
+
+    OnRecv on_recv;
+    OnSend on_send;
     OnClose on_close;
     std::uint8_t *read_buf;
-    RingBuffer<Write> write_queue;
+    RingBuffer<Send> send_queue;
     void *context;
 };
 
@@ -67,15 +84,16 @@ struct TcpListener {
  * @brief Public interface for tcp client, containing a handle to the underlying
  * representation.
  */
-struct TcpClientView {
+class TcpClientView {
 public:
     TcpClientView(Handle handle, EventLoop &loop) : handle_(handle), loop_(&loop) {}
 
-    void write(std::uint8_t *buf, std::uint32_t size);
+    void send(std::uint8_t *buf, std::uint32_t size);
+    void close(CloseType type = CloseType::Graceful);
 
     void set_context(void *context);
-    void set_onread(OnRead on_read);
-    void set_onwrite(OnWrite on_write);
+    void set_onrecv(OnRecv on_recv);
+    void set_onsend(OnSend on_send);
     void set_onclose(OnClose on_close);
 
     EventLoop &loop() { return *loop_; }
@@ -89,7 +107,7 @@ private:
  * @brief Public interface for tcp listener, containing a handle to the
  * underlying representation.
  */
-struct TcpListenerView {
+class TcpListenerView {
 public:
     TcpListenerView(Handle handle, EventLoop &loop) : handle_(handle), loop_(&loop) {}
 
@@ -103,10 +121,11 @@ private:
 enum class MessageType : std::uint8_t {
     CreateListener,
     TcpConnect,
-    TcpWrite,
+    TcpSend,
+    TcpClose,
     SetContext,
-    SetOnRead,
-    SetOnWrite,
+    SetOnRecv,
+    SetOnSend,
     SetOnClose
 };
 
@@ -124,9 +143,14 @@ struct ConnectMessage {
     OnConnect on_connect;
 };
 
-struct WriteMessage {
+struct SendMessage {
     std::uint8_t *buf;
     std::uint32_t size;
+    std::uint64_t handle;
+};
+
+struct CloseMessage {
+    CloseType type;
     std::uint64_t handle;
 };
 
@@ -135,17 +159,17 @@ struct SetContextMessage {
     std::uint64_t handle;
 };
 
-struct SetOnRead {
-    OnRead on_read;
+struct SetOnRecvMessage {
+    OnRecv on_read;
     std::uint64_t handle;
 };
 
-struct SetOnWrite {
-    OnWrite on_write;
+struct SetOnSendMessage {
+    OnSend on_write;
     std::uint64_t handle;
 };
 
-struct SetOnClose {
+struct SetOnCloseMessage {
     OnClose on_close;
     std::uint64_t handle;
 };
@@ -157,11 +181,12 @@ struct Message {
     union {
         CreateListenerMessage create_listener;
         ConnectMessage connect;
-        WriteMessage write;
+        SendMessage send;
+        CloseMessage close;
         SetContextMessage set_context;
-        SetOnRead set_onread;
-        SetOnWrite set_onwrite;
-        SetOnClose set_onclose;
+        SetOnRecvMessage set_onrecv;
+        SetOnSendMessage set_onsend;
+        SetOnCloseMessage set_onclose;
     } msg;
     MessageType type;
 };
@@ -230,14 +255,14 @@ private:
  */
 class EventLoop {
 public:
-    EventLoop(int thread_id = 0);
+    explicit EventLoop(int thread_id = 0);
     ~EventLoop() = default;
 
     void post(Message msg);
 
     void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept);
     void tcp_connect(std::uint32_t host, std::uint16_t port, void *context, OnConnect on_connect);
-    void tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
+    void tcp_send(Handle handle, std::uint8_t *buf, std::uint32_t size);
     void tcp_close(Handle handle);
 
     void run();
@@ -271,20 +296,24 @@ private:
     void handle_accept(Handle handle, int result, std::uint32_t flags);
     void handle_socket(Handle handle, int result, std::uint32_t flags);
     void handle_connect(Handle handle, int result, std::uint32_t flags);
-    void handle_read(Handle handle, int result, std::uint32_t flags);
-    void handle_write(Handle handle, int result, std::uint32_t flags);
+    void handle_recv(Handle handle, int result, std::uint32_t flags);
+    void handle_send(Handle handle, int result, std::uint32_t flags);
+    void handle_shutdown_wr(Handle handle, int result, std::uint32_t flags);
+    void handle_shutdown_rdwr(Handle handle, int result, std::uint32_t flags);
+    void handle_close(Handle handle, int result, std::uint32_t flags);
 
     void do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
                        OnAccept on_accept);
     void do_tcp_connect(std::uint32_t host, std::uint16_t port, void *context,
                         OnConnect on_connect);
-    void do_tcp_write(Handle handle, std::uint8_t *buf, std::uint32_t size);
+    void do_tcp_send(Handle handle, std::uint8_t *buf, std::uint32_t size);
+    void do_tcp_close(Handle handle, CloseType type = CloseType::Graceful);
     void do_set_context(Handle handle, void *context);
-    void do_set_onread(Handle handle, OnRead on_read);
-    void do_set_onwrite(Handle handle, OnWrite on_write);
+    void do_set_onrecv(Handle handle, OnRecv on_read);
+    void do_set_onsend(Handle handle, OnSend on_write);
     void do_set_onclose(Handle handle, OnClose on_close);
 
-    friend struct TcpClientView;
+    friend class TcpClientView;
 };
 
 inline std::uint32_t ipv4_address(std::uint8_t one, std::uint8_t two, std::uint8_t three,
