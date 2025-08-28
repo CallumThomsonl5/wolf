@@ -479,7 +479,7 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
             }
         } else {
             ring_.sq_push_send(client.fd, write.buf, std::min(write.size, MAX_WRITE_SIZE),
-                                set_operation(handle, Op::TcpSend));
+                               set_operation(handle, Op::TcpSend));
             client.send_pending = true;
         }
 
@@ -487,7 +487,8 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
     }
 
     // Full write
-    client.on_send(TcpClientView(handle, *this), client.context, NetworkError::Ok);
+    client.on_send(TcpClientView(handle, *this), write.buf, write.size, client.context,
+                   NetworkError::Ok);
     client.send_queue.pop();
 
     // Close may have been called in on_write
@@ -554,8 +555,10 @@ void EventLoop::handle_close(std::uint64_t handle, int result, std::uint32_t fla
     }
 
     while (!client.send_queue.empty()) {
+        auto [buf, size] = client.send_queue.peek();
+        client.on_send(TcpClientView(handle, *this), buf, size, client.context,
+                       NetworkError::Closed);
         client.send_queue.pop();
-        client.on_send(TcpClientView(handle, *this), client.context, NetworkError::Closed);
     }
 
     client.on_close(TcpClientView(handle, *this), client.context, NetworkError::Ok);
@@ -635,15 +638,15 @@ void EventLoop::do_tcp_send(std::uint64_t handle, std::uint8_t *buf, std::uint32
     }
 
     if (client.closing || !client.write_side_open) {
-        // TODO: change on_write to accept pointer and length of buffer
-        client.on_send(TcpClientView(handle, *this), client.context, NetworkError::Closed);
+        client.on_send(TcpClientView(handle, *this), buf, size, client.context,
+                       NetworkError::Closed);
         return;
     }
 
     client.send_queue.push({.buf = buf, .size = size});
     if (!client.send_pending) {
         ring_.sq_push_send(client.fd, buf, std::min(size, MAX_WRITE_SIZE),
-                            set_operation(handle, Op::TcpSend));
+                           set_operation(handle, Op::TcpSend));
         client.send_pending = true;
     }
 }

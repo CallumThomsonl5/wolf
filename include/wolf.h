@@ -26,7 +26,7 @@ using OnAccept = void (*)(TcpClientView, NetworkError err);
 using OnConnect = void (*)(TcpClientView, void *context, NetworkError err);
 using OnRecv = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
                         NetworkError err);
-using OnSend = void (*)(TcpClientView, void *context, NetworkError err);
+using OnSend = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context, NetworkError err);
 using OnClose = void (*)(TcpClientView client, void *context, NetworkError err);
 
 using Handle = std::uint64_t;
