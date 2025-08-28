@@ -461,7 +461,6 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
 
     if (result < 0) {
         // TODO: deal with this properly
-        client.on_send(TcpClientView(handle, *this), client.context, NetworkError::Unknown);
         do_tcp_close(handle, CloseType::Abort);
         return;
     }
