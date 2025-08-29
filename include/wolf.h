@@ -67,7 +67,7 @@ struct TcpClient {
     OnSend on_send;
     OnClose on_close;
     std::uint8_t *read_buf;
-    RingBuffer<Send> send_queue;
+    RingBuffer<Send, 4> send_queue;
     void *context;
 };
 
