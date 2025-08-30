@@ -312,7 +312,7 @@ void EventLoop::handle_messages() {
         }
     }
 
-    ring_.sq_push_recv(wake_fd_, reinterpret_cast<std::uint8_t *>(&wake_buf_), sizeof(wake_buf_),
+    ring_.sq_push_read(wake_fd_, reinterpret_cast<std::uint8_t *>(&wake_buf_), sizeof(wake_buf_),
                        set_operation(0, Op::Wake));
 }
 
@@ -565,6 +565,7 @@ void EventLoop::handle_close(std::uint64_t handle, int result, std::uint32_t fla
 
     client.generation++;
     tcp_free_clients_.push_back(get_index(handle));
+    buffer_allocator_.free(client.read_buf);
 }
 
 void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
@@ -741,7 +742,7 @@ void EventLoop::run() {
 
     // arm eventfd wake
     ring_.sq_start_push();
-    ring_.sq_push_recv(wake_fd_, reinterpret_cast<std::uint8_t *>(wake_buf_), sizeof(wake_buf_),
+    ring_.sq_push_read(wake_fd_, reinterpret_cast<std::uint8_t *>(wake_buf_), sizeof(wake_buf_),
                        set_operation(0, Op::Wake));
     ring_.sq_end_push();
 

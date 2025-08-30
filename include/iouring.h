@@ -72,6 +72,8 @@ public:
     void sq_ensure_space();
     void sq_push(io_uring_sqe &sqe);
     void sq_push_accept(int fd, std::uint64_t user_data);
+    void sq_push_read(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
+    void sq_push_write(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
     void sq_push_send(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
     void sq_push_recv(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
     void sq_push_connect(int fd, sockaddr *addr, std::size_t sockaddr_size, std::uint64_t user_data);
@@ -290,6 +292,35 @@ inline void IOUring::sq_push_accept(int fd, std::uint64_t user_data) {
     sq_array_[index] = index;
     to_submit_++;
 }
+
+inline void IOUring::sq_push_read(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
+    sq_ensure_space();
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {
+        .opcode = IORING_OP_READ,
+        .fd = fd,
+        .addr = std::bit_cast<std::uint64_t>(buf),
+        .len = size,
+        .user_data = user_data
+    };
+    sq_array_[index] = index;
+    to_submit_++;
+}
+
+inline void IOUring::sq_push_write(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
+    sq_ensure_space();
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {
+        .opcode = IORING_OP_WRITE,
+        .fd = fd,
+        .addr = std::bit_cast<std::uint64_t>(buf),
+        .len = size,
+        .user_data = user_data
+    };
+    sq_array_[index] = index;
+    to_submit_++;
+}
+
 
 inline void IOUring::sq_push_send(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
     sq_ensure_space();
