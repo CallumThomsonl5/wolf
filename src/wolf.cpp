@@ -64,7 +64,7 @@ thread_local wolf::EventLoop *thread_loop = nullptr;
 
 constexpr std::uint32_t LISTEN_BACKLOG = 4096;
 constexpr std::uint32_t RING_ENTRIES_HINT = 8192;
-constexpr std::uint32_t MAX_WRITE_SIZE = 8192;
+constexpr std::uint32_t MAX_WRITE_SIZE = 65536;
 constexpr std::uint32_t MAX_ACCEPTS = 256;
 
 wolf::NetworkError create_listening_socket(std::uint32_t host, std::uint16_t port, int &socket_fd) {
@@ -501,8 +501,8 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
     }
 
     if (!client.send_queue.empty()) {
-        write = client.send_queue.peek();
-        ring_.sq_push_send(client.fd, write.buf, write.size, set_operation(handle, Op::TcpSend));
+        auto [buf, size] = client.send_queue.peek();
+        ring_.sq_push_send(client.fd, buf, size, set_operation(handle, Op::TcpSend));
         client.send_pending = true;
         return;
     }
