@@ -198,7 +198,7 @@ struct PendingConnection {
     struct sockaddr_in sockaddr{};
 };
 
-constexpr std::size_t READ_BUF_SIZE = 4096;
+constexpr std::size_t READ_BUF_SIZE = 65536;
 
 /**
  * @internal

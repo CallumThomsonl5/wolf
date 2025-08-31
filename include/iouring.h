@@ -286,6 +286,7 @@ inline void IOUring::sq_push_accept(int fd, std::uint64_t user_data) {
     std::uint32_t index = sq_new_tail_++ & sq_mask_;
     sq_sqes_[index] = {
         .opcode = IORING_OP_ACCEPT,
+        .ioprio = IORING_ACCEPT_MULTISHOT,
         .fd = fd,
         .user_data = user_data
     };

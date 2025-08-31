@@ -65,7 +65,6 @@ thread_local wolf::EventLoop *thread_loop = nullptr;
 constexpr std::uint32_t LISTEN_BACKLOG = 4096;
 constexpr std::uint32_t RING_ENTRIES_HINT = 8192;
 constexpr std::uint32_t MAX_WRITE_SIZE = 65536;
-constexpr std::uint32_t MAX_ACCEPTS = 256;
 
 wolf::NetworkError create_listening_socket(std::uint32_t host, std::uint16_t port, int &socket_fd) {
     using wolf::NetworkError;
@@ -360,7 +359,10 @@ void EventLoop::handle_accept(std::uint64_t handle, int result, std::uint32_t fl
         TcpClientView client_view(0, *this);
         listener.on_accept(client_view, NetworkError::Unknown);
     }
-    ring_.sq_push_accept(listener.fd, set_operation(handle, Op::TcpAccept));
+
+    if (!(flags & IORING_CQE_F_MORE)) {
+        ring_.sq_push_accept(listener.fd, set_operation(handle, Op::TcpAccept));
+    }
 }
 
 void EventLoop::handle_socket(Handle handle, int result, std::uint32_t flags) {
@@ -598,9 +600,7 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
     listener = TcpListenerView(handle, *this);
 
     // post accept sqe
-    for (int i = 0; i < MAX_ACCEPTS; i++) {
-        ring_.sq_push_accept(fd, set_operation(handle, Op::TcpAccept));
-    }
+    ring_.sq_push_accept(fd, set_operation(handle, Op::TcpAccept));
     on_listen(listener, err);
 }
 
