@@ -1,6 +1,6 @@
 #include "wolf.h"
 
-#include "handle.h"
+#include "internal/handle.h"
 
 #include <arpa/inet.h>
 #include <memory>
@@ -192,35 +192,35 @@ void EventLoop::wake() { eventfd_write(wake_fd_, 1); }
 void EventLoop::handle_cqe(io_uring_cqe *cqe) {
     std::uint64_t handle = cqe->user_data;
 
-    switch (handle::get_op(handle)) {
-    case handle::Op::TcpAccept:
+    switch (internal::get_op(handle)) {
+    case internal::Op::TcpAccept:
         handle_accept(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::TcpSocket:
+    case internal::Op::TcpSocket:
         handle_socket(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::TcpConnect:
+    case internal::Op::TcpConnect:
         handle_connect(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::TcpRecv:
+    case internal::Op::TcpRecv:
         handle_recv(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::TcpSend:
+    case internal::Op::TcpSend:
         handle_send(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::TcpShutdownWr:
+    case internal::Op::TcpShutdownWr:
         handle_shutdown_wr(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::TcpShutdownRdWr:
+    case internal::Op::TcpShutdownRdWr:
         handle_shutdown_rdwr(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::TcpClose:
+    case internal::Op::TcpClose:
         handle_close(cqe->user_data, cqe->res, cqe->flags);
         break;
-    case handle::Op::Timer:
+    case internal::Op::Timer:
         // Silence error
         break;
-    case handle::Op::Wake:
+    case internal::Op::Wake:
         handle_messages();
         break;
     }
@@ -266,7 +266,7 @@ void EventLoop::handle_messages() {
     }
 
     ring_.sq_push_read(wake_fd_, reinterpret_cast<std::uint8_t *>(&wake_buf_), sizeof(wake_buf_),
-                       handle::set_op(0, handle::Op::Wake));
+                       internal::set_op(0, internal::Op::Wake));
 }
 
 TcpClientView EventLoop::create_client(int fd) {
@@ -294,17 +294,17 @@ TcpClientView EventLoop::create_client(int fd) {
     tcp_clients_[index].closing = false;
     tcp_clients_[index].close_sent = false;
 
-    std::uint64_t handle = handle::make(thread_id_, index, tcp_clients_[index].generation);
+    std::uint64_t handle = internal::make(thread_id_, index, tcp_clients_[index].generation);
     TcpClientView client_view(handle, *this);
 
     ring_.sq_push_recv(fd, tcp_clients_[index].read_buf, READ_BUF_SIZE,
-                       handle::set_op(handle, handle::Op::TcpRecv));
+                       internal::set_op(handle, internal::Op::TcpRecv));
 
     return client_view;
 }
 
 void EventLoop::handle_accept(std::uint64_t handle, int result, std::uint32_t flags) {
-    TcpListener &listener = tcp_listeners_[handle::get_index(handle)];
+    TcpListener &listener = tcp_listeners_[internal::get_index(handle)];
     if (result >= 0) {
         TcpClientView client_view = create_client(result);
         listener.on_accept(client_view, NetworkError::Ok);
@@ -315,27 +315,27 @@ void EventLoop::handle_accept(std::uint64_t handle, int result, std::uint32_t fl
     }
 
     if (!(flags & IORING_CQE_F_MORE)) {
-        ring_.sq_push_accept(listener.fd, handle::set_op(handle, handle::Op::TcpAccept));
+        ring_.sq_push_accept(listener.fd, internal::set_op(handle, internal::Op::TcpAccept));
     }
 }
 
 void EventLoop::handle_socket(Handle handle, int result, std::uint32_t flags) {
-    PendingConnection &pending = *pending_connections_[handle::get_index(handle)].get();
+    PendingConnection &pending = *pending_connections_[internal::get_index(handle)].get();
 
     if (result < 0) {
         // TODO: more detailed error
         pending.on_connect(TcpClientView(0, *this), pending.context, NetworkError::Unknown);
-        free_pending_connections_.push_back(handle::get_index(handle));
+        free_pending_connections_.push_back(internal::get_index(handle));
         return;
     }
 
     pending.fd = result;
     ring_.sq_push_connect(result, reinterpret_cast<sockaddr *>(&pending.sockaddr),
-                          sizeof(pending.sockaddr), handle::set_op(handle, handle::Op::TcpConnect));
+                          sizeof(pending.sockaddr), internal::set_op(handle, internal::Op::TcpConnect));
 }
 
 void EventLoop::handle_connect(Handle handle, int result, std::uint32_t flags) {
-    PendingConnection &pending = *pending_connections_[handle::get_index(handle)].get();
+    PendingConnection &pending = *pending_connections_[internal::get_index(handle)].get();
 
     if (result < 0) {
         // TODO: more detailed error
@@ -346,13 +346,13 @@ void EventLoop::handle_connect(Handle handle, int result, std::uint32_t flags) {
         pending.on_connect(clientview, pending.context, NetworkError::Ok);
     }
 
-    free_pending_connections_.push_back(handle::get_index(handle));
+    free_pending_connections_.push_back(internal::get_index(handle));
 }
 
 void EventLoop::handle_recv(std::uint64_t handle, int result, std::uint32_t flags) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
 
-    if (client.generation != handle::get_gen(handle)) {
+    if (client.generation != internal::get_gen(handle)) {
         // stale request
         return;
     }
@@ -361,7 +361,7 @@ void EventLoop::handle_recv(std::uint64_t handle, int result, std::uint32_t flag
 
     if (client.closing) {
         if (!client.send_pending && !client.close_sent) {
-            ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+            ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
             client.close_sent = true;
         }
         return;
@@ -382,7 +382,7 @@ void EventLoop::handle_recv(std::uint64_t handle, int result, std::uint32_t flag
         client.read_side_open = false;
         if (!client.write_side_open && !client.send_pending) {
             client.close_sent = true;
-            ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+            ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
         } else {
             client.on_close(TcpClientView(handle, *this), client.context,
                             NetworkError::PeerShutdownWrite);
@@ -396,19 +396,19 @@ void EventLoop::handle_recv(std::uint64_t handle, int result, std::uint32_t flag
                    NetworkError::Ok);
     if (client.closing) {
         if (!client.send_pending && !client.close_sent) {
-            ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+            ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
             client.close_sent = true;
         }
         return;
     }
     ring_.sq_push_recv(client.fd, client.read_buf, READ_BUF_SIZE,
-                       handle::set_op(handle, handle::Op::TcpRecv));
+                       internal::set_op(handle, internal::Op::TcpRecv));
     client.recv_pending = true;
 }
 
 void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flags) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle)) {
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle)) {
         // stale request
         return;
     }
@@ -430,12 +430,12 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
 
         if (client.closing) {
             if (!client.recv_pending && !client.close_sent) {
-                ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+                ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
                 client.close_sent = true;
             }
         } else {
             ring_.sq_push_send(client.fd, write.buf, std::min(write.size, MAX_WRITE_SIZE),
-                               handle::set_op(handle, handle::Op::TcpSend));
+                               internal::set_op(handle, internal::Op::TcpSend));
             client.send_pending = true;
         }
 
@@ -450,7 +450,7 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
     // Close may have been called in on_write
     if (client.closing) {
         if (!client.recv_pending && !client.close_sent) {
-            ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+            ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
             client.close_sent = true;
         }
         return;
@@ -458,7 +458,7 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
 
     if (!client.send_queue.empty()) {
         auto [buf, size] = client.send_queue.peek();
-        ring_.sq_push_send(client.fd, buf, size, handle::set_op(handle, handle::Op::TcpSend));
+        ring_.sq_push_send(client.fd, buf, size, internal::set_op(handle, internal::Op::TcpSend));
         client.send_pending = true;
         return;
     }
@@ -467,11 +467,11 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
         // All pending writes are complete, so issue shutdown
         if (!client.read_side_open) {
             if (!client.close_sent) {
-                ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+                ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
                 client.close_sent = true;
             }
         } else if (!client.wr_shutdown_sent) {
-            ring_.sq_push_shutdown(client.fd, SHUT_WR, handle::set_op(handle, handle::Op::TcpShutdownWr));
+            ring_.sq_push_shutdown(client.fd, SHUT_WR, internal::set_op(handle, internal::Op::TcpShutdownWr));
             client.wr_shutdown_sent = true;
         }
 
@@ -480,8 +480,8 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
 }
 
 void EventLoop::handle_shutdown_wr(std::uint64_t handle, int result, std::uint32_t flags) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle))
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle))
         return;
 
     if (result < 0) {
@@ -490,8 +490,8 @@ void EventLoop::handle_shutdown_wr(std::uint64_t handle, int result, std::uint32
 }
 
 void EventLoop::handle_shutdown_rdwr(std::uint64_t handle, int result, std::uint32_t flags) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle))
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle))
         return;
 
     if (result < 0) {
@@ -501,8 +501,8 @@ void EventLoop::handle_shutdown_rdwr(std::uint64_t handle, int result, std::uint
 }
 
 void EventLoop::handle_close(std::uint64_t handle, int result, std::uint32_t flags) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle))
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle))
         return;
 
     if (result < 0) {
@@ -520,7 +520,7 @@ void EventLoop::handle_close(std::uint64_t handle, int result, std::uint32_t fla
     client.on_close(TcpClientView(handle, *this), client.context, NetworkError::Ok);
 
     client.generation++;
-    tcp_free_clients_.push_back(handle::get_index(handle));
+    tcp_free_clients_.push_back(internal::get_index(handle));
     buffer_allocator_.free(client.read_buf);
 }
 
@@ -550,11 +550,11 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
     tcp_listeners_[index].fd = fd;
     tcp_listeners_[index].on_accept = on_accept;
 
-    std::uint64_t handle = handle::make(thread_id_, index, tcp_listeners_[index].generation);
+    std::uint64_t handle = internal::make(thread_id_, index, tcp_listeners_[index].generation);
     listener = TcpListenerView(handle, *this);
 
     // post accept sqe
-    ring_.sq_push_accept(fd, handle::set_op(handle, handle::Op::TcpAccept));
+    ring_.sq_push_accept(fd, internal::set_op(handle, internal::Op::TcpAccept));
     on_listen(listener, err);
 }
 
@@ -581,13 +581,13 @@ void EventLoop::do_tcp_connect(std::uint32_t host, std::uint16_t port, void *con
     };
 
     ring_.sq_push_socket(AF_INET, SOCK_STREAM, 0,
-                         handle::set_op(handle::make(thread_id_, index, 0), handle::Op::TcpSocket));
+                         internal::set_op(internal::make(thread_id_, index, 0), internal::Op::TcpSocket));
 }
 
 void EventLoop::do_tcp_send(std::uint64_t handle, std::uint8_t *buf, std::uint32_t size) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
 
-    if (client.generation != handle::get_gen(handle)) {
+    if (client.generation != internal::get_gen(handle)) {
         // stale
         return;
     }
@@ -601,15 +601,15 @@ void EventLoop::do_tcp_send(std::uint64_t handle, std::uint8_t *buf, std::uint32
     client.send_queue.push({.buf = buf, .size = size});
     if (!client.send_pending) {
         ring_.sq_push_send(client.fd, buf, std::min(size, MAX_WRITE_SIZE),
-                           handle::set_op(handle, handle::Op::TcpSend));
+                           internal::set_op(handle, internal::Op::TcpSend));
         client.send_pending = true;
     }
 }
 
 void EventLoop::do_tcp_close(Handle handle, CloseType type) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
 
-    if (client.generation != handle::get_gen(handle)) {
+    if (client.generation != internal::get_gen(handle)) {
         return;
     }
 
@@ -632,13 +632,13 @@ void EventLoop::do_tcp_close(Handle handle, CloseType type) {
         if (client.read_side_open) {
             if (!client.wr_shutdown_sent) {
                 ring_.sq_push_shutdown(client.fd, SHUT_WR,
-                                       handle::set_op(handle, handle::Op::TcpShutdownWr));
+                                       internal::set_op(handle, internal::Op::TcpShutdownWr));
                 client.wr_shutdown_sent = true;
             }
         } else {
             // Both read and write sides are closed now, so close connection
             if (!client.close_sent) {
-                ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+                ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
                 client.close_sent = true;
             }
         }
@@ -648,43 +648,43 @@ void EventLoop::do_tcp_close(Handle handle, CloseType type) {
         client.write_side_open = false;
 
         if (!client.recv_pending && !client.send_pending) {
-            ring_.sq_push_close(client.fd, handle::set_op(handle, handle::Op::TcpClose));
+            ring_.sq_push_close(client.fd, internal::set_op(handle, internal::Op::TcpClose));
             client.close_sent = true;
         } else if (!client.rdwr_shutdown_sent) {
             ring_.sq_push_shutdown(client.fd, SHUT_RDWR,
-                                   handle::set_op(handle, handle::Op::TcpShutdownRdWr));
+                                   internal::set_op(handle, internal::Op::TcpShutdownRdWr));
             client.rdwr_shutdown_sent = true;
         }
     }
 }
 
 void EventLoop::do_set_context(std::uint64_t handle, void *context) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle)) {
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle)) {
         return;
     }
     client.context = context;
 }
 
 void EventLoop::do_set_onrecv(std::uint64_t handle, OnRecv on_read) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle)) {
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle)) {
         return;
     }
     client.on_recv = on_read;
 }
 
 void EventLoop::do_set_onsend(std::uint64_t handle, OnSend on_write) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle)) {
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle)) {
         return;
     }
     client.on_send = on_write;
 }
 
 void EventLoop::do_set_onclose(std::uint64_t handle, OnClose on_close) {
-    TcpClient &client = tcp_clients_[handle::get_index(handle)];
-    if (client.generation != handle::get_gen(handle)) {
+    TcpClient &client = tcp_clients_[internal::get_index(handle)];
+    if (client.generation != internal::get_gen(handle)) {
         return;
     }
     client.on_close = on_close;
@@ -697,7 +697,7 @@ void EventLoop::run() {
     // arm eventfd wake
     ring_.sq_start_push();
     ring_.sq_push_read(wake_fd_, reinterpret_cast<std::uint8_t *>(wake_buf_), sizeof(wake_buf_),
-                       handle::set_op(0, handle::Op::Wake));
+                       internal::set_op(0, internal::Op::Wake));
     ring_.sq_end_push();
 
     while (is_running_) {

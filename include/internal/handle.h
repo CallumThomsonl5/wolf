@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-namespace wolf::handle {
+namespace wolf::internal {
 
 /* handle format: Op(4)|THREAD_ID(6)|INDEX(22)|GENERATION(32) */
 using Handle = std::uint64_t;

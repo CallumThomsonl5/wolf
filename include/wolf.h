@@ -1,16 +1,16 @@
 #ifndef WOLF_H_INCLUDED
 #define WOLF_H_INCLUDED
 
-#include <cstdint>
-#include <memory>
-#include <vector>
+#include "internal/iouring.h"
+#include "internal/mpsc_queue.h"
+#include "internal/ringbuffer.h"
 
 #include <linux/io_uring.h>
 #include <netinet/in.h>
 
-#include <iouring.h>
-#include <mpsc_queue.h>
-#include <ringbuffer.h>
+#include <cstdint>
+#include <memory>
+#include <vector>
 
 namespace wolf {
 
@@ -26,7 +26,8 @@ using OnAccept = void (*)(TcpClientView, NetworkError err);
 using OnConnect = void (*)(TcpClientView, void *context, NetworkError err);
 using OnRecv = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
                         NetworkError err);
-using OnSend = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context, NetworkError err);
+using OnSend = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
+                        NetworkError err);
 using OnClose = void (*)(TcpClientView client, void *context, NetworkError err);
 
 using Handle = std::uint64_t;
@@ -34,12 +35,18 @@ using Handle = std::uint64_t;
 /**
  * @brief Errors that can arise during networking.
  */
-enum class NetworkError { Ok, PermissionDenied, LimitReached, NoMemory, AddressInUse, PeerShutdownWrite, Closed, Unknown };
-
-enum class CloseType {
-    Abort,
-    Graceful
+enum class NetworkError {
+    Ok,
+    PermissionDenied,
+    LimitReached,
+    NoMemory,
+    AddressInUse,
+    PeerShutdownWrite,
+    Closed,
+    Unknown
 };
+
+enum class CloseType { Abort, Graceful };
 
 /**
  * @brief Owned and used internally to represent a tcp client connection.
@@ -284,6 +291,10 @@ private:
     std::vector<int> tcp_free_listeners_;
 
     BufferAllocator buffer_allocator_;
+
+    // std::vector<Timer> timers_;
+    // std::vector<int> free_timers_;
+    // TimerHeap timer_heap_;
 
     MPSCQueue<Message> msg_queue_;
     int wake_fd_;
