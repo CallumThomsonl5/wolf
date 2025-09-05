@@ -285,7 +285,7 @@ public:
 private:
     bool is_running_ = false;
 
-    IOUring ring_;
+    internal::IOUring ring_;
 
     std::vector<std::unique_ptr<PendingConnection>> pending_connections_;
     std::vector<int> free_pending_connections_;
