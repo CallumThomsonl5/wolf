@@ -1,9 +1,9 @@
 #include "wolf.h"
 
 #include "internal/handle.h"
+#include "internal/timers.h"
 
 #include <arpa/inet.h>
-#include <memory>
 #include <netinet/in.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -137,7 +137,7 @@ void TcpClientView::set_onclose(OnClose on_close) {
 
 EventLoop::EventLoop(int thread_id)
     : ring_(RING_ENTRIES_HINT), wake_fd_(eventfd(1, 0)), thread_id_(thread_id), tcp_clients_(10),
-      tcp_listeners_(1), pending_connections_(10) {
+      tcp_listeners_(1), pending_connections_(10), timers_(10), timer_heap_(timers_) {
     // add indexes to free list
     for (int i = 0; i < tcp_clients_.size(); i++) {
         tcp_free_clients_.push_back(i);
@@ -147,10 +147,16 @@ EventLoop::EventLoop(int thread_id)
         tcp_free_listeners_.push_back(i);
     }
 
+    for (int i = 0; i < timers_.size(); i++) {
+        free_timers_.push_back(i);
+    }
+
     for (int i = 0; i < pending_connections_.size(); i++) {
         pending_connections_[i] = std::make_unique<PendingConnection>();
         free_pending_connections_.push_back(i);
     }
+
+    time_ = internal::ClockType::now();
 }
 
 void EventLoop::post(Message msg) {
@@ -185,6 +191,49 @@ void EventLoop::tcp_connect(std::uint32_t host, std::uint16_t port, void *contex
                                   .on_connect = on_connect}},
               .type = MessageType::TcpConnect});
     }
+}
+
+Handle EventLoop::set_timeout(OnTimeout on_timeout, void *context, std::uint64_t ms) {
+    if (free_timers_.empty()) {
+        int size = timers_.size();
+        timers_.resize(size * 2);
+        for (int i = (size * 2) - 1; i >= size; i--) {
+            free_timers_.push_back(i);
+        }
+    }
+
+    int index = free_timers_.back();
+    free_timers_.pop_back();
+
+    timers_[index].time = time_ + std::chrono::milliseconds(ms);
+    timers_[index].context = context;
+    timers_[index].on_timeout = on_timeout;
+    timers_[index].repeating = false;
+
+    Handle handle = internal::make(thread_id_, index, timers_[index].generation);
+
+    timer_heap_.push(index);
+
+    return handle;
+}
+
+Handle EventLoop::set_interval(OnTimeout on_timeout, void *context, std::uint64_t ms) {
+    Handle handle = set_timeout(on_timeout, context, ms);
+    timers_[internal::get_index(handle)].repeating = true;
+    timers_[internal::get_index(handle)].interval = std::chrono::milliseconds(ms);
+    return handle;
+}
+
+void EventLoop::cancel_timer(Handle handle) {
+    std::uint32_t index = internal::get_index(handle);
+    internal::Timer &timer = timers_[index];
+    if (internal::get_gen(handle) != timer.generation) {
+        return;
+    }
+
+    timer_heap_.cancel(index);
+    timer.generation++;
+    free_timers_.push_back(index);
 }
 
 void EventLoop::wake() { eventfd_write(wake_fd_, 1); }
@@ -701,7 +750,36 @@ void EventLoop::run() {
     ring_.sq_end_push();
 
     while (is_running_) {
-        ring_.enter();
+        time_ = internal::ClockType::now();
+
+        timer_heap_.pop_due(time_, [&](std::uint32_t index){
+            internal::Timer &timer = timers_[index];
+
+            std::uint32_t gen = timer.generation;
+
+            timer.on_timeout(timer.context);
+            if (timer.generation != gen) {
+                // callback altered timer
+                return;
+            }
+
+            if (!timer.repeating) {
+                timer.generation++;
+                free_timers_.push_back(index);
+            } else {
+                internal::DurationType diff = time_ - timer.time;
+                auto n = 1 + (diff / timer.interval);
+                timer.time += n * timer.interval;
+                timer_heap_.push(index);
+            }
+        });
+
+        internal::DurationType until_next = timer_heap_.time_until_next(time_);
+        if (until_next > internal::DurationType{0}) {
+            ring_.enter(until_next);
+        } else {
+            ring_.enter();
+        }
 
         ring_.cq_start_pop();
         ring_.sq_start_push();

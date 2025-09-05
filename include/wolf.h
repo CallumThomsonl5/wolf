@@ -4,6 +4,7 @@
 #include "internal/iouring.h"
 #include "internal/mpsc_queue.h"
 #include "internal/ringbuffer.h"
+#include "internal/timers.h"
 
 #include <linux/io_uring.h>
 #include <netinet/in.h>
@@ -272,6 +273,10 @@ public:
     void tcp_send(Handle handle, std::uint8_t *buf, std::uint32_t size);
     void tcp_close(Handle handle);
 
+    Handle set_timeout(OnTimeout on_timeout, void *context, std::uint64_t);
+    Handle set_interval(OnTimeout on_timeout, void *context, std::uint64_t);
+    void cancel_timer(Handle handle);
+
     void run();
     void stop();
 
@@ -292,9 +297,10 @@ private:
 
     BufferAllocator buffer_allocator_;
 
-    // std::vector<Timer> timers_;
-    // std::vector<int> free_timers_;
-    // TimerHeap timer_heap_;
+    internal::TimeType time_;
+    std::vector<internal::Timer> timers_;
+    std::vector<int> free_timers_;
+    internal::TimerHeap timer_heap_;
 
     MPSCQueue<Message> msg_queue_;
     int wake_fd_;
