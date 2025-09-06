@@ -46,8 +46,9 @@ public:
     IOUring(IOUring &&ref);
 
     template <typename Rep, typename Period>
-    int enter(std::chrono::duration<Rep, Period> timeout);
+    int enter_timeout(std::chrono::duration<Rep, Period> timeout);
     int enter();
+    int enter_wait();
 
     bool sq_full() const;
     void sq_ensure_space();
@@ -126,7 +127,7 @@ private:
  * @param timeout Maximum time to block before timing out.
  */
 template <typename Rep, typename Period>
-inline int IOUring::enter(std::chrono::duration<Rep, Period> timeout) {
+inline int IOUring::enter_timeout(std::chrono::duration<Rep, Period> timeout) {
     // Kernel >= 5.11
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(timeout);
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - secs);

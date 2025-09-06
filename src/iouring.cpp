@@ -84,14 +84,31 @@ IOUring::IOUring(std::uint32_t entries) {
 }
 
 /**
- * @brief Attempts to submit SQs then waits for at least one completion.
+ * @brief Attempts to submit SQEs
  *
- * Never times out unlike overloaded version.
  */
 int IOUring::enter() {
     // Kernel >= 5.11
     io_uring_getevents_arg arg{};
     int ret = io_uring_enter(fd_.fd, to_submit_, 1, IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
+                             std::bit_cast<sigset_t *>(&arg), sizeof(arg));
+    if (ret >= 0) {
+        to_submit_ -= ret;
+        return 0;
+    } else {
+        return ret;
+    }
+}
+
+/**
+ * @brief Attempts to submit SQEs then waits for at least one completion.
+ *
+ * Never times out unlike enter_timeout.
+ */
+int IOUring::enter_wait() {
+    // Kernel >= 5.11
+    io_uring_getevents_arg arg{};
+    int ret = io_uring_enter(fd_.fd, to_submit_, 0, IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
                              std::bit_cast<sigset_t *>(&arg), sizeof(arg));
     if (ret >= 0) {
         to_submit_ -= ret;
