@@ -12,7 +12,7 @@
 namespace /* internals */ {
 
 constexpr std::uint32_t LISTEN_BACKLOG = 4096;
-constexpr std::uint32_t RING_ENTRIES_HINT = 8192;
+constexpr std::uint32_t RING_ENTRIES_HINT = 16384;
 constexpr std::uint32_t MAX_WRITE_SIZE = 65536;
 
 thread_local wolf::EventLoop *thread_loop = nullptr;
@@ -776,9 +776,9 @@ void EventLoop::run() {
 
         internal::DurationType until_next = timer_heap_.time_until_next(time_);
         if (until_next > internal::DurationType{0}) {
-            ring_.enter(until_next);
+            ring_.enter_timeout(until_next);
         } else {
-            ring_.enter();
+            ring_.enter_wait();
         }
 
         ring_.cq_start_pop();
