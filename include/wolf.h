@@ -75,7 +75,7 @@ struct TcpClient {
     OnSend on_send;
     OnClose on_close;
     std::uint8_t *read_buf;
-    RingBuffer<Send, 4> send_queue;
+    internal::RingBuffer<Send, 4> send_queue;
     void *context;
 };
 
@@ -302,7 +302,7 @@ private:
     std::vector<int> free_timers_;
     internal::TimerHeap timer_heap_;
 
-    MPSCQueue<Message> msg_queue_;
+    internal::MPSCQueue<Message> msg_queue_;
     int wake_fd_;
     std::uint64_t wake_buf_;
     int thread_id_;

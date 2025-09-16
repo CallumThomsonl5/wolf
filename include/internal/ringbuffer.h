@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <algorithm>
 
+namespace wolf::internal {
+
 template <typename T, std::uint32_t S>
 class RingBuffer {
     static_assert(S != 0 && ((S - 1) & S) == 0, "S must be a non-zero power of 2");
 public:
-    RingBuffer() = default; 
+    RingBuffer() = default;
 
     RingBuffer(const RingBuffer<T, S> &b) = delete;
     RingBuffer(RingBuffer<T, S> &&b) noexcept : overflow_buffer_(b.overflow_buffer_), head_(b.head_), tail_(b.tail_), size_(b.size_), overflow_(b.overflow_) {
@@ -101,3 +103,5 @@ private:
     std::uint32_t size_ = S;
     bool overflow_ = false;
 };
+
+} // namespace wolf::internal

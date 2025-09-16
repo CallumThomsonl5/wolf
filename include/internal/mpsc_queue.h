@@ -1,11 +1,12 @@
-#ifndef MPSC_QUEUE_H_INCLUDED
-#define MPSC_QUEUE_H_INCLUDED
+#pragma once
 
 #include <mutex>
 #include <queue>
 #include <vector>
 
 #include <sys/eventfd.h>
+
+namespace wolf::internal {
 
 template <typename T>
 class MPSCQueue {
@@ -42,4 +43,4 @@ private:
     std::mutex mtx_;
 };
 
-#endif
+} // namespace wolf::internal
