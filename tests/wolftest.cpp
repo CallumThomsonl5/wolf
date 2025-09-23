@@ -18,11 +18,11 @@ static void on_recv(wolf::TcpClientView client, std::uint8_t *buf, std::size_t s
         return;
     }
 
-    client.send((std::uint8_t *)context, size);
+    client.send((std::uint8_t *)context, size, (void *)0x12452);
 }
 
 static void on_send(wolf::TcpClientView client, std::uint8_t *buf, std::size_t size, void *context,
-                    wolf::NetworkError err) {
+                    void *send_ctx, wolf::NetworkError err) {
     if (err != wolf::NetworkError::Ok) {
         std::cout << "on_send: error\n";
         return;
@@ -63,9 +63,8 @@ int main(void) {
     // use raw address for now until async getaddrinfo is added.
     loop.tcp_listen(wolf::ipv4_address(127, 0, 0, 1), 4444, on_listen, on_accept);
 
-    wolf::Handle handle = loop.set_timeout([](void *context){
-        std::puts("timeout");
-    }, nullptr, 1000);
+    wolf::Handle handle =
+        loop.set_timeout([](void *context) { std::puts("timeout"); }, nullptr, 1000);
 
     loop.run();
 

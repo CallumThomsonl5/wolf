@@ -28,7 +28,7 @@ using OnConnect = void (*)(TcpClientView, void *context, NetworkError err);
 using OnRecv = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
                         NetworkError err);
 using OnSend = void (*)(TcpClientView, std::uint8_t *buf, std::size_t size, void *context,
-                        NetworkError err);
+                        void *send_ctx, NetworkError err);
 using OnClose = void (*)(TcpClientView client, void *context, NetworkError err);
 
 using Handle = std::uint64_t;
@@ -54,6 +54,7 @@ enum class CloseType { Abort, Graceful };
  */
 struct TcpClient {
     struct Send {
+        void *context;
         std::uint8_t *buf;
         std::uint32_t size;
     };
@@ -96,7 +97,7 @@ class TcpClientView {
 public:
     TcpClientView(Handle handle, EventLoop &loop) : handle_(handle), loop_(&loop) {}
 
-    void send(std::uint8_t *buf, std::uint32_t size);
+    void send(std::uint8_t *buf, std::uint32_t size, void *send_ctx);
     void close(CloseType type = CloseType::Graceful);
 
     void set_context(void *context);
@@ -152,9 +153,10 @@ struct ConnectMessage {
 };
 
 struct SendMessage {
+    void *context;
     std::uint8_t *buf;
-    std::uint32_t size;
     std::uint64_t handle;
+    std::uint32_t size;
 };
 
 struct CloseMessage {
@@ -270,7 +272,7 @@ public:
 
     void tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen, OnAccept on_accept);
     void tcp_connect(std::uint32_t host, std::uint16_t port, void *context, OnConnect on_connect);
-    void tcp_send(Handle handle, std::uint8_t *buf, std::uint32_t size);
+    void tcp_send(Handle handle, std::uint8_t *buf, std::uint32_t size, void *send_ctx);
     void tcp_close(Handle handle);
 
     Handle set_timeout(OnTimeout on_timeout, void *context, std::uint64_t);
@@ -323,7 +325,7 @@ private:
                        OnAccept on_accept);
     void do_tcp_connect(std::uint32_t host, std::uint16_t port, void *context,
                         OnConnect on_connect);
-    void do_tcp_send(Handle handle, std::uint8_t *buf, std::uint32_t size);
+    void do_tcp_send(Handle handle, std::uint8_t *buf, std::uint32_t size, void *send_ctx);
     void do_tcp_close(Handle handle, CloseType type = CloseType::Graceful);
     void do_set_context(Handle handle, void *context);
     void do_set_onrecv(Handle handle, OnRecv on_read);

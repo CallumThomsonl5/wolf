@@ -8,7 +8,6 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 
-
 namespace /* internals */ {
 
 constexpr std::uint32_t LISTEN_BACKLOG = 4096;
@@ -81,12 +80,13 @@ wolf::NetworkError create_listening_socket(std::uint32_t host, std::uint16_t por
 
 namespace wolf {
 
-void TcpClientView::send(std::uint8_t *buf, std::uint32_t size) {
+void TcpClientView::send(std::uint8_t *buf, std::uint32_t size, void *send_ctx) {
     if (thread_loop == loop_) {
-        loop_->do_tcp_send(handle_, buf, size);
+        loop_->do_tcp_send(handle_, buf, size, send_ctx);
     } else {
-        loop_->post({.msg = {.send{.buf = buf, .size = size, .handle = handle_}},
-                     .type = MessageType::TcpSend});
+        loop_->post(
+            {.msg = {.send{.context = send_ctx, .buf = buf, .handle = handle_, .size = size}},
+             .type = MessageType::TcpSend});
     }
 }
 
@@ -289,7 +289,7 @@ void EventLoop::handle_messages() {
         } break;
         case MessageType::TcpSend: {
             SendMessage &msg = m.msg.send;
-            do_tcp_send(msg.handle, msg.buf, msg.size);
+            do_tcp_send(msg.handle, msg.buf, msg.size, msg.context);
         } break;
         case MessageType::TcpClose: {
             CloseMessage &msg = m.msg.close;
@@ -380,7 +380,8 @@ void EventLoop::handle_socket(Handle handle, int result, std::uint32_t flags) {
 
     pending.fd = result;
     ring_.sq_push_connect(result, reinterpret_cast<sockaddr *>(&pending.sockaddr),
-                          sizeof(pending.sockaddr), internal::set_op(handle, internal::Op::TcpConnect));
+                          sizeof(pending.sockaddr),
+                          internal::set_op(handle, internal::Op::TcpConnect));
 }
 
 void EventLoop::handle_connect(Handle handle, int result, std::uint32_t flags) {
@@ -493,7 +494,7 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
 
     // Full write
     client.on_send(TcpClientView(handle, *this), write.buf, write.size, client.context,
-                   NetworkError::Ok);
+                   write.context, NetworkError::Ok);
     client.send_queue.pop();
 
     // Close may have been called in on_write
@@ -506,7 +507,7 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
     }
 
     if (!client.send_queue.empty()) {
-        auto [buf, size] = client.send_queue.peek();
+        auto [send_ctx, buf, size] = client.send_queue.peek();
         ring_.sq_push_send(client.fd, buf, size, internal::set_op(handle, internal::Op::TcpSend));
         client.send_pending = true;
         return;
@@ -520,7 +521,8 @@ void EventLoop::handle_send(std::uint64_t handle, int result, std::uint32_t flag
                 client.close_sent = true;
             }
         } else if (!client.wr_shutdown_sent) {
-            ring_.sq_push_shutdown(client.fd, SHUT_WR, internal::set_op(handle, internal::Op::TcpShutdownWr));
+            ring_.sq_push_shutdown(client.fd, SHUT_WR,
+                                   internal::set_op(handle, internal::Op::TcpShutdownWr));
             client.wr_shutdown_sent = true;
         }
 
@@ -560,8 +562,8 @@ void EventLoop::handle_close(std::uint64_t handle, int result, std::uint32_t fla
     }
 
     while (!client.send_queue.empty()) {
-        auto [buf, size] = client.send_queue.peek();
-        client.on_send(TcpClientView(handle, *this), buf, size, client.context,
+        auto [send_ctx, buf, size] = client.send_queue.peek();
+        client.on_send(TcpClientView(handle, *this), buf, size, client.context, send_ctx,
                        NetworkError::Closed);
         client.send_queue.pop();
     }
@@ -629,11 +631,13 @@ void EventLoop::do_tcp_connect(std::uint32_t host, std::uint16_t port, void *con
         .sin_addr = {.s_addr = htonl(host)},
     };
 
-    ring_.sq_push_socket(AF_INET, SOCK_STREAM, 0,
-                         internal::set_op(internal::make(thread_id_, index, 0), internal::Op::TcpSocket));
+    ring_.sq_push_socket(
+        AF_INET, SOCK_STREAM, 0,
+        internal::set_op(internal::make(thread_id_, index, 0), internal::Op::TcpSocket));
 }
 
-void EventLoop::do_tcp_send(std::uint64_t handle, std::uint8_t *buf, std::uint32_t size) {
+void EventLoop::do_tcp_send(std::uint64_t handle, std::uint8_t *buf, std::uint32_t size,
+                            void *send_ctx) {
     TcpClient &client = tcp_clients_[internal::get_index(handle)];
 
     if (client.generation != internal::get_gen(handle)) {
@@ -642,12 +646,12 @@ void EventLoop::do_tcp_send(std::uint64_t handle, std::uint8_t *buf, std::uint32
     }
 
     if (client.closing || !client.write_side_open) {
-        client.on_send(TcpClientView(handle, *this), buf, size, client.context,
+        client.on_send(TcpClientView(handle, *this), buf, size, client.context, send_ctx,
                        NetworkError::Closed);
         return;
     }
 
-    client.send_queue.push({.buf = buf, .size = size});
+    client.send_queue.push({.context = send_ctx, .buf = buf, .size = size});
     if (!client.send_pending) {
         ring_.sq_push_send(client.fd, buf, std::min(size, MAX_WRITE_SIZE),
                            internal::set_op(handle, internal::Op::TcpSend));
@@ -752,7 +756,7 @@ void EventLoop::run() {
     while (is_running_) {
         time_ = internal::ClockType::now();
 
-        timer_heap_.pop_due(time_, [&](std::uint32_t index){
+        timer_heap_.pop_due(time_, [&](std::uint32_t index) {
             internal::Timer &timer = timers_[index];
 
             std::uint32_t gen = timer.generation;
