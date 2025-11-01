@@ -7,6 +7,9 @@
 #include <netinet/in.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+
+#include <cassert>
 
 namespace /* internals */ {
 
@@ -80,6 +83,73 @@ wolf::NetworkError create_listening_socket(std::uint32_t host, std::uint16_t por
 
 namespace wolf {
 
+void FileView::write_to(std::size_t pos, const std::uint8_t *buf, std::size_t len, void *write_ctx,
+                        OnWrite on_write) {
+    if (thread_loop == loop_) {
+        loop_->do_file_write(handle_, pos, buf, len, FileWriteFlags::None, write_ctx, on_write);
+    } else {
+        loop_->post({.msg =
+                         {
+                             .file_write = {.flags = FileWriteFlags::None,
+                                            .pos = pos,
+                                            .buf = buf,
+                                            .len = len,
+                                            .write_ctx = write_ctx,
+                                            .on_write = on_write},
+                         },
+                     .type = MessageType::FileWrite});
+    }
+}
+
+void FileView::read_from(std::size_t pos, std::uint8_t *buf, std::size_t len, void *read_ctx,
+                         OnRead on_read) {
+    if (thread_loop == loop_) {
+        loop_->do_file_read_from(handle_, pos, buf, len, read_ctx, on_read);
+    } else {
+        loop_->post({.msg = {.file_read = {.pos = pos,
+                                           .buf = buf,
+                                           .len = len,
+                                           .read_ctx = read_ctx,
+                                           .on_read = on_read}},
+                     .type = MessageType::FileRead});
+    }
+}
+
+void FileView::append_safe(const std::uint8_t *buf, std::size_t len, void *write_ctx,
+                           OnWrite on_write) {
+    if (thread_loop == loop_) {
+        loop_->do_file_write(handle_, 0, buf, len, FileWriteFlags::AtomicAppend, write_ctx,
+                             on_write);
+    } else {
+        loop_->post({.msg =
+                         {
+                             .file_write = {.flags = FileWriteFlags::AtomicAppend,
+                                            .buf = buf,
+                                            .len = len,
+                                            .write_ctx = write_ctx,
+                                            .on_write = on_write},
+                         },
+                     .type = MessageType::FileWrite});
+    }
+}
+
+void FileView::append_fast(const std::uint8_t *buf, std::size_t len, void *write_ctx,
+                           OnWrite on_write) {
+    if (thread_loop == loop_) {
+        loop_->do_file_write(handle_, 0, buf, len, FileWriteFlags::FastAppend, write_ctx, on_write);
+    } else {
+        loop_->post({.msg =
+                         {
+                             .file_write = {.flags = FileWriteFlags::FastAppend,
+                                            .buf = buf,
+                                            .len = len,
+                                            .write_ctx = write_ctx,
+                                            .on_write = on_write},
+                         },
+                     .type = MessageType::FileWrite});
+    }
+}
+
 void TcpClientView::send(std::uint8_t *buf, std::uint32_t size, void *send_ctx) {
     if (thread_loop == loop_) {
         loop_->do_tcp_send(handle_, buf, size, send_ctx);
@@ -126,7 +196,7 @@ void TcpClientView::set_onsend(OnSend on_send) {
     }
 }
 
-void TcpClientView::set_onclose(OnClose on_close) {
+void TcpClientView::set_onclose(OnTcpClose on_close) {
     if (thread_loop == loop_) {
         loop_->do_set_onclose(handle_, on_close);
     } else {
@@ -137,7 +207,7 @@ void TcpClientView::set_onclose(OnClose on_close) {
 
 EventLoop::EventLoop(int thread_id)
     : ring_(RING_ENTRIES_HINT), wake_fd_(eventfd(1, 0)), thread_id_(thread_id), tcp_clients_(10),
-      tcp_listeners_(1), pending_connections_(10), timers_(10), timer_heap_(timers_) {
+      tcp_listeners_(1), pending_connections_(10), timers_(10), timer_heap_(timers_), files_(10) {
     // add indexes to free list
     for (int i = 0; i < tcp_clients_.size(); i++) {
         tcp_free_clients_.push_back(i);
@@ -149,6 +219,10 @@ EventLoop::EventLoop(int thread_id)
 
     for (int i = 0; i < timers_.size(); i++) {
         free_timers_.push_back(i);
+    }
+
+    for (int i = 0; i < files_.size(); i++) {
+        free_files_.push_back(i);
     }
 
     for (int i = 0; i < pending_connections_.size(); i++) {
@@ -193,6 +267,21 @@ void EventLoop::tcp_connect(std::uint32_t host, std::uint16_t port, void *contex
     }
 }
 
+void EventLoop::file_open(const char *path, FileMode mode, FileOptions options, int perms,
+                          void *context, OnOpen on_open) {
+    if (thread_loop == this) {
+        do_file_open(path, mode, options, perms, context, on_open);
+    } else {
+        post({.msg = {.file_open = {.path = path,
+                                    .mode = mode,
+                                    .options = options,
+                                    .perms = perms,
+                                    .context = context,
+                                    .on_open = on_open}},
+              .type = MessageType::FileOpen});
+    }
+}
+
 Handle EventLoop::set_timeout(OnTimeout on_timeout, void *context, std::uint64_t ms) {
     if (free_timers_.empty()) {
         int size = timers_.size();
@@ -210,7 +299,7 @@ Handle EventLoop::set_timeout(OnTimeout on_timeout, void *context, std::uint64_t
     timers_[index].on_timeout = on_timeout;
     timers_[index].repeating = false;
 
-    Handle handle = internal::make(thread_id_, index, timers_[index].generation);
+    Handle handle = internal::make_handle(thread_id_, index, timers_[index].generation);
 
     timer_heap_.push(index);
 
@@ -266,6 +355,12 @@ void EventLoop::handle_cqe(io_uring_cqe *cqe) {
     case internal::Op::TcpClose:
         handle_close(cqe->user_data, cqe->res, cqe->flags);
         break;
+    case internal::Op::FileOpen:
+        handle_file_open(cqe->user_data, cqe->res, cqe->flags);
+        break;
+    case internal::Op::FileRead:
+        handle_file_read(cqe->user_data, cqe->res, cqe->flags); 
+        break;
     case internal::Op::Timer:
         // Silence error
         break;
@@ -311,6 +406,19 @@ void EventLoop::handle_messages() {
             SetOnCloseMessage &msg = m.msg.set_onclose;
             do_set_onclose(msg.handle, msg.on_close);
         } break;
+        case MessageType::FileOpen: {
+            FileOpenMessage &msg = m.msg.file_open;
+            do_file_open(msg.path, msg.mode, msg.options, msg.perms, msg.context, msg.on_open);
+        } break;
+        case MessageType::FileRead: {
+            FileReadMessage &msg = m.msg.file_read;
+            do_file_read_from(msg.handle, msg.pos, msg.buf, msg.len, msg.read_ctx, msg.on_read);
+        } break;
+        case MessageType::FileWrite: {
+            FileWriteMessage &msg = m.msg.file_write;
+            do_file_write(msg.handle, msg.pos, msg.buf, msg.len, msg.flags, msg.write_ctx,
+                          msg.on_write);
+        } break;
         }
     }
 
@@ -343,7 +451,7 @@ TcpClientView EventLoop::create_client(int fd) {
     tcp_clients_[index].closing = false;
     tcp_clients_[index].close_sent = false;
 
-    std::uint64_t handle = internal::make(thread_id_, index, tcp_clients_[index].generation);
+    std::uint64_t handle = internal::make_handle(thread_id_, index, tcp_clients_[index].generation);
     TcpClientView client_view(handle, *this);
 
     ring_.sq_push_recv(fd, tcp_clients_[index].read_buf, READ_BUF_SIZE,
@@ -575,6 +683,43 @@ void EventLoop::handle_close(std::uint64_t handle, int result, std::uint32_t fla
     buffer_allocator_.free(client.read_buf);
 }
 
+void EventLoop::handle_file_open(std::uint64_t handle, int result, std::uint32_t flags) {
+    File &file = files_[internal::get_index(handle)];
+    // TODO: deal with closing file while opening
+    if (file.generation != internal::get_gen(handle)) {
+        return;
+    }
+
+    if (result < 0) {
+        // TODO: handle this
+        assert(false);
+    }
+
+    file.fd = result;
+
+    struct stat stat;
+    if (fstat(file.fd, &stat) < 0) {
+        // TODO: handle
+        assert(false);
+    }
+    file.append_pos = stat.st_size;
+
+    FileView view(internal::clear_op(handle), *this);
+    file.on_open(view, file.context, FileError::Ok);
+}
+
+
+void EventLoop::handle_file_read(std::uint64_t handle, int result, std::uint32_t flags) {
+    File &file = files_[internal::get_index(handle)];
+    if (file.generation != internal::get_gen(handle)) {
+        return;
+    }
+
+    if (result < 0) {
+        assert(false);
+    }
+}
+
 void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen on_listen,
                               OnAccept on_accept) {
     int fd;
@@ -601,7 +746,8 @@ void EventLoop::do_tcp_listen(std::uint32_t host, std::uint16_t port, OnListen o
     tcp_listeners_[index].fd = fd;
     tcp_listeners_[index].on_accept = on_accept;
 
-    std::uint64_t handle = internal::make(thread_id_, index, tcp_listeners_[index].generation);
+    std::uint64_t handle =
+        internal::make_handle(thread_id_, index, tcp_listeners_[index].generation);
     listener = TcpListenerView(handle, *this);
 
     // post accept sqe
@@ -633,7 +779,7 @@ void EventLoop::do_tcp_connect(std::uint32_t host, std::uint16_t port, void *con
 
     ring_.sq_push_socket(
         AF_INET, SOCK_STREAM, 0,
-        internal::set_op(internal::make(thread_id_, index, 0), internal::Op::TcpSocket));
+        internal::set_op(internal::make_handle(thread_id_, index, 0), internal::Op::TcpSocket));
 }
 
 void EventLoop::do_tcp_send(std::uint64_t handle, std::uint8_t *buf, std::uint32_t size,
@@ -735,12 +881,42 @@ void EventLoop::do_set_onsend(std::uint64_t handle, OnSend on_write) {
     client.on_send = on_write;
 }
 
-void EventLoop::do_set_onclose(std::uint64_t handle, OnClose on_close) {
+void EventLoop::do_set_onclose(std::uint64_t handle, OnTcpClose on_close) {
     TcpClient &client = tcp_clients_[internal::get_index(handle)];
     if (client.generation != internal::get_gen(handle)) {
         return;
     }
     client.on_close = on_close;
+}
+
+void EventLoop::do_file_open(const char *path, FileMode mode, FileOptions options, int perms,
+                             void *context, OnOpen on_open) {
+    if (free_files_.empty()) {
+        int size = files_.size();
+        files_.resize(size * 2);
+        for (int i = (size * 2) - 1; i >= size; i--) {
+            free_files_.push_back(i);
+        }
+    }
+
+    int index = free_files_.back();
+    free_files_.pop_back();
+
+    std::uint32_t flags = static_cast<std::uint32_t>(mode) | static_cast<std::uint32_t>(options);
+
+    files_[index].fd = -1;
+    files_[index].context = context;
+    files_[index].on_open = on_open;
+    files_[index].on_read = nullptr;
+    files_[index].on_write = nullptr;
+    files_[index].on_close = nullptr;
+    files_[index].inflight_ops = 0;
+    files_[index].append_pos = 0;
+    files_[index].flags = flags;
+    files_[index].ops_queue.clear();
+
+    Handle handle = internal::make_handle(thread_id_, index, files_[index].generation);
+    ring_.sq_push_openat(path, flags, perms, internal::set_op(handle, internal::Op::FileOpen));
 }
 
 void EventLoop::run() {

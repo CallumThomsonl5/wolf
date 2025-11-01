@@ -66,6 +66,10 @@ int main(void) {
     wolf::Handle handle =
         loop.set_timeout([](void *context) { std::puts("timeout"); }, nullptr, 1000);
 
+    loop.file_open(
+        "./fuck.txt", wolf::FileMode::Read, wolf::FileOptions::Create, 0666, nullptr,
+        [](wolf::FileView file, void *context, wolf::FileError err) { std::puts("file open"); });
+
     loop.run();
 
     return 0;

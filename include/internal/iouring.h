@@ -62,6 +62,9 @@ public:
                          std::uint64_t user_data);
     void sq_push_socket(int domain, int type, int protocol, std::uint64_t user_data);
     void sq_push_shutdown(int fd, int how, std::uint64_t user_data);
+    void sq_push_openat(const char *path, std::uint32_t flags, std::uint32_t mode, std::uint64_t user_data);
+    void sq_push_read(int fd, std::size_t pos, std::uint8_t *buf, std::size_t size, std::uint32_t flags, std::uint64_t user_data);
+    void sq_push_write(int fd, std::size_t pos, const std::uint8_t *buf, std::size_t size, std::uint32_t flags, std::uint64_t user_data);
     void sq_push_close(int fd, std::uint64_t user_data);
 
     void sq_start_push();

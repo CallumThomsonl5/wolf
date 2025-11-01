@@ -1,5 +1,7 @@
 #include "internal/iouring.h"
 
+#include <bit>
+#include <fcntl.h>
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
 #include <sys/mman.h>
@@ -90,7 +92,7 @@ IOUring::IOUring(std::uint32_t entries) {
 int IOUring::enter() {
     // Kernel >= 5.11
     io_uring_getevents_arg arg{};
-    int ret = io_uring_enter(fd_.fd, to_submit_, 1, IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
+    int ret = io_uring_enter(fd_.fd, to_submit_, 0, IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
                              std::bit_cast<sigset_t *>(&arg), sizeof(arg));
     if (ret >= 0) {
         to_submit_ -= ret;
@@ -108,7 +110,7 @@ int IOUring::enter() {
 int IOUring::enter_wait() {
     // Kernel >= 5.11
     io_uring_getevents_arg arg{};
-    int ret = io_uring_enter(fd_.fd, to_submit_, 0, IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
+    int ret = io_uring_enter(fd_.fd, to_submit_, 1, IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
                              std::bit_cast<sigset_t *>(&arg), sizeof(arg));
     if (ret >= 0) {
         to_submit_ -= ret;
@@ -241,6 +243,52 @@ void IOUring::sq_push_shutdown(int fd, int how, std::uint64_t user_data) {
     std::uint32_t index = sq_new_tail_++ & sq_mask_;
     sq_sqes_[index] = {
         .opcode = IORING_OP_SHUTDOWN, .fd = fd, .len = std::uint32_t(how), .user_data = user_data};
+    sq_array_[index] = index;
+    to_submit_++;
+}
+
+void IOUring::sq_push_openat(const char *path, std::uint32_t flags, std::uint32_t mode,
+                             std::uint64_t user_data) {
+    sq_ensure_space();
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {
+        .opcode = IORING_OP_OPENAT,
+        .fd = AT_FDCWD,
+        .addr = std::bit_cast<std::uint64_t>(path),
+        .len = mode,
+        .open_flags = flags,
+        .user_data = user_data,
+    };
+    sq_array_[index] = index;
+    to_submit_++;
+}
+
+void IOUring::sq_push_read(int fd, std::size_t pos, std::uint8_t *buf, std::size_t size,
+                           std::uint32_t flags, std::uint64_t user_data) {
+    sq_ensure_space();
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {.opcode = IORING_OP_READ,
+                       .fd = fd,
+                       .off = pos,
+                       .addr = std::bit_cast<std::uint64_t>(buf),
+                       .len = static_cast<std::uint32_t>(size),
+                       .rw_flags = flags,
+                       .user_data = user_data};
+    sq_array_[index] = index;
+    to_submit_++;
+}
+
+void IOUring::sq_push_write(int fd, std::size_t pos, const std::uint8_t *buf, std::size_t size,
+                            std::uint32_t flags, std::uint64_t user_data) {
+    sq_ensure_space();
+    std::uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {.opcode = IORING_OP_WRITE,
+                       .fd = fd,
+                       .off = pos,
+                       .addr = std::bit_cast<std::uint64_t>(buf),
+                       .len = static_cast<std::uint32_t>(size),
+                       .rw_flags = flags,
+                       .user_data = user_data};
     sq_array_[index] = index;
     to_submit_++;
 }
