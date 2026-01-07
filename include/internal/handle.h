@@ -5,7 +5,7 @@
 
 namespace wolf::internal {
 
-/* handle format: Op(4)|THREAD_ID(6)|INDEX(22)|GENERATION(32) */
+/* handle format: Op(5)|THREAD_ID(7)|INDEX(22)|GENERATION(30) */
 using Handle = std::uint64_t;
 
 enum class Op : std::uint8_t {
@@ -24,10 +24,10 @@ enum class Op : std::uint8_t {
     Wake,
 };
 
-constexpr int OP_BITS = 4;
-constexpr int THREAD_ID_BITS = 6;
+constexpr int OP_BITS = 5;
+constexpr int THREAD_ID_BITS = 7;
 constexpr int INDEX_BITS = 22;
-constexpr int GENERATION_BITS = 32;
+constexpr int GENERATION_BITS = 30;
 
 static_assert(OP_BITS + THREAD_ID_BITS + INDEX_BITS + GENERATION_BITS == 64);
 
@@ -39,6 +39,9 @@ constexpr std::uint64_t OP_MASK = ((1ULL << OP_BITS) - 1) << OP_SHIFT;
 constexpr std::uint64_t THREAD_ID_MASK = ((1ULL << THREAD_ID_BITS) - 1) << THREAD_ID_SHIFT;
 constexpr std::uint64_t INDEX_MASK = ((1ULL << INDEX_BITS) - 1) << INDEX_SHIFT;
 
+// Used for pending file ops user_data
+constexpr std::uint64_t PENDING_OP_INDEX_MASK = ~OP_MASK;
+
 constexpr inline Handle make_handle(int thread_id, int index, std::uint32_t gen) {
     return (std::uint64_t(thread_id) << THREAD_ID_SHIFT) | (std::uint64_t(index) << INDEX_SHIFT) |
            std::uint64_t(gen);
@@ -49,6 +52,14 @@ constexpr inline Handle set_op(Handle h, Op op) {
 }
 
 constexpr inline Handle clear_op(Handle h) { return h & (~OP_MASK); }
+
+constexpr inline Handle set_pending_op_index(Handle h, std::uint64_t op_index) {
+    return (h & OP_MASK) | (op_index & PENDING_OP_INDEX_MASK);
+}
+
+constexpr inline Handle get_pending_op_index(Handle h) {
+    return h & PENDING_OP_INDEX_MASK;
+}
 
 constexpr inline Op get_op(Handle h) { return Op(h >> OP_SHIFT); }
 constexpr inline int get_thread(Handle h) { return int((h & THREAD_ID_MASK) >> THREAD_ID_SHIFT); }
