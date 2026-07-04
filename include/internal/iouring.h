@@ -11,14 +11,14 @@
 
 namespace wolf::internal {
 
-inline int io_uring_enter(std::uint32_t fd, std::uint32_t to_submit, std::uint32_t min_complete,
-                          std::uint32_t flags, sigset_t *sig, std::size_t sz) {
+inline int io_uring_enter(uint32_t fd, uint32_t to_submit, uint32_t min_complete,
+                          uint32_t flags, sigset_t *sig, size_t sz) {
 
     int ret = -1;
 #if defined(__x86_64__)
-    register std::uint32_t r10 asm("r10") = flags;
+    register uint32_t r10 asm("r10") = flags;
     register sigset_t *r8 asm("r8") = sig;
-    register std::size_t r9 asm("r9") = sz;
+    register size_t r9 asm("r9") = sz;
     asm volatile("syscall"
                  : "=a"(ret)
                  : "a"(SYS_io_uring_enter), "D"(fd), "S"(to_submit), "d"(min_complete), "r"(r10),
@@ -40,7 +40,7 @@ inline int io_uring_enter(std::uint32_t fd, std::uint32_t to_submit, std::uint32
  */
 class IOUring {
 public:
-    IOUring(std::uint32_t entries);
+    IOUring(uint32_t entries);
     ~IOUring() = default;
     IOUring(const IOUring &) = delete;
     IOUring(IOUring &&ref);
@@ -52,20 +52,26 @@ public:
 
     bool sq_full() const;
     void sq_ensure_space();
-    void sq_push(io_uring_sqe &sqe);
-    void sq_push_accept(int fd, std::uint64_t user_data);
-    void sq_push_read(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
-    void sq_push_write(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
-    void sq_push_send(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
-    void sq_push_recv(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data);
-    void sq_push_connect(int fd, sockaddr *addr, std::size_t sockaddr_size,
-                         std::uint64_t user_data);
-    void sq_push_socket(int domain, int type, int protocol, std::uint64_t user_data);
-    void sq_push_shutdown(int fd, int how, std::uint64_t user_data);
-    void sq_push_openat(const char *path, std::uint32_t flags, std::uint32_t mode, std::uint64_t user_data);
-    void sq_push_read(int fd, std::size_t pos, std::uint8_t *buf, std::size_t size, std::uint32_t flags, std::uint64_t user_data);
-    void sq_push_write(int fd, std::size_t pos, const std::uint8_t *buf, std::size_t size, std::uint32_t flags, std::uint64_t user_data);
-    void sq_push_close(int fd, std::uint64_t user_data);
+
+
+    io_uring_sqe &sq_slot();
+
+    void sq_push_accept(int fd, uint64_t user_data);
+    void sq_push_read(int fd, uint8_t *buf, uint32_t size, uint64_t user_data);
+    void sq_push_pread(int fd, size_t pos, uint8_t *buf, uint32_t size,
+                           uint32_t flags, uint64_t user_data);
+    void sq_push_write(int fd, uint8_t *buf, uint32_t size, uint64_t user_data);
+    void sq_push_pwrite(int fd, size_t pos, const uint8_t *buf, uint32_t size,
+                            uint32_t flags, uint64_t user_data);
+
+    void sq_push_send(int fd, uint8_t *buf, uint32_t size, uint64_t user_data);
+    void sq_push_recv(int fd, uint8_t *buf, uint32_t size, uint64_t user_data);
+    void sq_push_connect(int fd, sockaddr *addr, size_t sockaddr_size,
+                         uint64_t user_data);
+    void sq_push_socket(int domain, int type, int protocol, uint64_t user_data);
+    void sq_push_shutdown(int fd, int how, uint64_t user_data);
+    void sq_push_openat(const char *path, uint32_t flags, uint32_t mode, uint64_t user_data);
+    void sq_push_close(int fd, uint64_t user_data);
 
     void sq_start_push();
     void sq_end_push();
@@ -78,12 +84,12 @@ private:
     class MmapDeleter {
     public:
         MmapDeleter() {}
-        MmapDeleter(std::size_t size) : size_(size) {}
+        MmapDeleter(size_t size) : size_(size) {}
 
         void operator()(void *ptr) { munmap(ptr, size_); }
 
     private:
-        std::size_t size_ = 0;
+        size_t size_ = 0;
     };
 
     struct FdDeleter {
@@ -100,27 +106,27 @@ private:
     int to_submit_ = 0;
 
     // SQ ints
-    std::uint32_t sq_size_ = 0;
-    std::uint32_t sq_mask_ = 0;
-    std::uint32_t sq_new_tail_ = 0;
+    uint32_t sq_size_ = 0;
+    uint32_t sq_mask_ = 0;
+    uint32_t sq_new_tail_ = 0;
 
     // CQ ints
-    std::uint32_t cq_size_ = 0;
-    std::uint32_t cq_mask_ = 0;
-    std::uint32_t cq_new_head_ = 0;
+    uint32_t cq_size_ = 0;
+    uint32_t cq_mask_ = 0;
+    uint32_t cq_new_head_ = 0;
 
     // SQ ptrs
     std::unique_ptr<void, MmapDeleter> sq_ptr_;
     std::unique_ptr<io_uring_sqe[], MmapDeleter> sq_sqes_;
-    std::uint32_t *sq_array_ = nullptr;
-    std::uint32_t *sq_head_ = nullptr;
-    std::uint32_t *sq_tail_ = nullptr;
+    uint32_t *sq_array_ = nullptr;
+    uint32_t *sq_head_ = nullptr;
+    uint32_t *sq_tail_ = nullptr;
 
     // CQ ptrs
     std::unique_ptr<void, MmapDeleter> cq_ptr_;
     io_uring_cqe *cq_array_ = nullptr;
-    std::uint32_t *cq_head_ = nullptr;
-    std::uint32_t *cq_tail_ = nullptr;
+    uint32_t *cq_head_ = nullptr;
+    uint32_t *cq_tail_ = nullptr;
 };
 
 /**
@@ -135,7 +141,8 @@ inline int IOUring::enter_timeout(std::chrono::duration<Rep, Period> timeout) {
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(timeout);
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - secs);
     __kernel_timespec ts{.tv_sec = secs.count(), .tv_nsec = ns.count()};
-    io_uring_getevents_arg arg{.ts = std::bit_cast<std::uint64_t>(&ts)};
+    io_uring_getevents_arg arg{};
+    arg.ts = reinterpret_cast<uint64_t>(&ts);
     int ret = io_uring_enter(fd_.fd, to_submit_, 1, IORING_ENTER_EXT_ARG | IORING_ENTER_GETEVENTS,
                              std::bit_cast<sigset_t *>(&arg), sizeof(arg));
     if (ret >= 0) {

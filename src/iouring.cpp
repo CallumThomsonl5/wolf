@@ -1,6 +1,5 @@
 #include "internal/iouring.h"
 
-#include <bit>
 #include <fcntl.h>
 #include <linux/io_uring.h>
 #include <linux/time_types.h>
@@ -31,12 +30,11 @@ namespace wolf::internal {
  *
  * @throws std::runtime_error if there is an error setting up the ring.
  */
-IOUring::IOUring(std::uint32_t entries) {
-    struct io_uring_params params{
-        .sq_entries = 0,
-        .cq_entries = 0,
-        .flags = IORING_SETUP_COOP_TASKRUN,
-    };
+IOUring::IOUring(uint32_t entries) {
+    struct io_uring_params params{};
+    params.sq_entries = 0;
+    params.cq_entries = 0;
+    params.flags = IORING_SETUP_COOP_TASKRUN;
 
     int fd = syscall(SYS_io_uring_setup, entries, &params);
     if (fd < 0) {
@@ -51,19 +49,19 @@ IOUring::IOUring(std::uint32_t entries) {
     sq_size_ = params.sq_entries;
     cq_size_ = params.cq_entries;
 
-    std::size_t sq_mmap_size = params.sq_off.array + sq_size_ * sizeof(std::uint32_t);
+    size_t sq_mmap_size = params.sq_off.array + sq_size_ * sizeof(uint32_t);
     void *sq_ptr = mmap(0, sq_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd,
                         IORING_OFF_SQ_RING);
     if (sq_ptr == MAP_FAILED) {
         throw std::runtime_error("mmap: failed to mmap sqring");
     }
     sq_ptr_ = std::unique_ptr<void, MmapDeleter>(sq_ptr, MmapDeleter(sq_mmap_size));
-    sq_head_ = (std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.head);
-    sq_tail_ = (std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.tail);
-    sq_mask_ = *(std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.ring_mask);
-    sq_array_ = (std::uint32_t *)((std::uint8_t *)sq_ptr + params.sq_off.array);
+    sq_head_ = (uint32_t *)((uint8_t *)sq_ptr + params.sq_off.head);
+    sq_tail_ = (uint32_t *)((uint8_t *)sq_ptr + params.sq_off.tail);
+    sq_mask_ = *(uint32_t *)((uint8_t *)sq_ptr + params.sq_off.ring_mask);
+    sq_array_ = (uint32_t *)((uint8_t *)sq_ptr + params.sq_off.array);
 
-    std::size_t sq_sqes_mmap_size = sq_size_ * sizeof(struct io_uring_sqe);
+    size_t sq_sqes_mmap_size = sq_size_ * sizeof(struct io_uring_sqe);
     void *sq_sqes = (io_uring_sqe *)mmap(0, sq_sqes_mmap_size, PROT_READ | PROT_WRITE,
                                          MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
     if (sq_sqes == MAP_FAILED) {
@@ -72,17 +70,17 @@ IOUring::IOUring(std::uint32_t entries) {
     sq_sqes_ = std::unique_ptr<io_uring_sqe[], MmapDeleter>((io_uring_sqe *)sq_sqes,
                                                             MmapDeleter(sq_sqes_mmap_size));
 
-    std::size_t cq_mmap_size = params.cq_off.cqes + cq_size_ * sizeof(struct io_uring_cqe);
+    size_t cq_mmap_size = params.cq_off.cqes + cq_size_ * sizeof(struct io_uring_cqe);
     void *cq_ptr = mmap(0, cq_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd,
                         IORING_OFF_CQ_RING);
     if (cq_ptr == MAP_FAILED) {
         throw std::runtime_error("mmap: failed to mmap cqring");
     }
     cq_ptr_ = std::unique_ptr<void, MmapDeleter>(cq_ptr, MmapDeleter(cq_mmap_size));
-    cq_head_ = (std::uint32_t *)((std::uint8_t *)cq_ptr + params.cq_off.head);
-    cq_tail_ = (std::uint32_t *)((std::uint8_t *)cq_ptr + params.cq_off.tail);
-    cq_mask_ = *(std::uint32_t *)((std::uint8_t *)cq_ptr + params.cq_off.ring_mask);
-    cq_array_ = (io_uring_cqe *)((std::uint8_t *)cq_ptr + params.cq_off.cqes);
+    cq_head_ = (uint32_t *)((uint8_t *)cq_ptr + params.cq_off.head);
+    cq_tail_ = (uint32_t *)((uint8_t *)cq_ptr + params.cq_off.tail);
+    cq_mask_ = *(uint32_t *)((uint8_t *)cq_ptr + params.cq_off.ring_mask);
+    cq_array_ = (io_uring_cqe *)((uint8_t *)cq_ptr + params.cq_off.cqes);
 }
 
 /**
@@ -138,167 +136,128 @@ void IOUring::sq_ensure_space() {
     }
 }
 
-/**
- * @brief Pushes SQE onto the SQ.
- *
- * Prior to a series of sq_push(), @ref sq_start_push() must be called. After a
- * series of sq_push() calls, @ref sq_end_push() must be called.
- */
-void IOUring::sq_push(io_uring_sqe &sqe) {
-    sq_end_push();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = sqe;
+io_uring_sqe &IOUring::sq_slot() {
+    sq_ensure_space();
+    uint32_t index = sq_new_tail_++ & sq_mask_;
+    sq_sqes_[index] = {};
     sq_array_[index] = index;
     to_submit_++;
+    return sq_sqes_[index];
 }
 
-void IOUring::sq_push_accept(int fd, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_ACCEPT,
-                       .ioprio = IORING_ACCEPT_MULTISHOT,
-                       .fd = fd,
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_accept(int fd, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_ACCEPT;
+    sqe.ioprio = IORING_ACCEPT_MULTISHOT;
+    sqe.fd = fd;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_read(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_READ,
-                       .fd = fd,
-                       .addr = std::bit_cast<std::uint64_t>(buf),
-                       .len = size,
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_read(int fd, uint8_t *buf, uint32_t size, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_READ;
+    sqe.fd = fd;
+    sqe.addr = reinterpret_cast<uint64_t>(buf);
+    sqe.len = size;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_write(int fd, std::uint8_t *buf, std::uint32_t size,
-                            std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_WRITE,
-                       .fd = fd,
-                       .addr = std::bit_cast<std::uint64_t>(buf),
-                       .len = size,
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_write(int fd, uint8_t *buf, uint32_t size,
+                            uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_WRITE;
+    sqe.fd = fd;
+    sqe.addr = reinterpret_cast<uint64_t>(buf);
+    sqe.len = size;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_send(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_SEND,
-                       .fd = fd,
-                       .addr = std::bit_cast<std::uint64_t>(buf),
-                       .len = size,
-                       .msg_flags = MSG_NOSIGNAL,
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_send(int fd, uint8_t *buf, uint32_t size, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_SEND;
+    sqe.fd = fd;
+    sqe.addr = reinterpret_cast<uint64_t>(buf);
+    sqe.len = size;
+    sqe.msg_flags = MSG_NOSIGNAL;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_recv(int fd, std::uint8_t *buf, std::uint32_t size, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_RECV,
-                       .fd = fd,
-                       .addr = std::bit_cast<std::uint64_t>(buf),
-                       .len = size,
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_recv(int fd, uint8_t *buf, uint32_t size, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_RECV;
+    sqe.fd = fd;
+    sqe.addr = reinterpret_cast<uint64_t>(buf);
+    sqe.len = size;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_connect(int fd, sockaddr *addr, std::size_t sockaddr_size,
-                              std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_CONNECT,
-                       .fd = fd,
-                       .off = sockaddr_size,
-                       .addr = std::bit_cast<std::uint64_t>(addr),
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_connect(int fd, sockaddr *addr, size_t sockaddr_size,
+                              uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_CONNECT;
+                       sqe.fd = fd;
+                       sqe.off = sockaddr_size;
+                       sqe.addr = reinterpret_cast<uint64_t>(addr);
+                       sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_socket(int domain, int type, int protocol, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_SOCKET,
-                       .fd = domain,
-                       .off = static_cast<std::uint64_t>(type),
-                       .len = static_cast<std::uint32_t>(protocol),
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_socket(int domain, int type, int protocol, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_SOCKET;
+    sqe.fd = domain;
+    sqe.off = static_cast<uint64_t>(type);
+    sqe.len = static_cast<uint32_t>(protocol);
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_shutdown(int fd, int how, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {
-        .opcode = IORING_OP_SHUTDOWN, .fd = fd, .len = std::uint32_t(how), .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_shutdown(int fd, int how, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_SHUTDOWN;
+    sqe.fd = fd;
+    sqe.len = static_cast<uint32_t>(how);
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_openat(const char *path, std::uint32_t flags, std::uint32_t mode,
-                             std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {
-        .opcode = IORING_OP_OPENAT,
-        .fd = AT_FDCWD,
-        .addr = std::bit_cast<std::uint64_t>(path),
-        .len = mode,
-        .open_flags = flags,
-        .user_data = user_data,
-    };
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_openat(const char *path, uint32_t flags, uint32_t mode,
+                             uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_OPENAT;
+    sqe.fd = AT_FDCWD;
+    sqe.addr = reinterpret_cast<uint64_t>(path);
+    sqe.len = mode;
+    sqe.open_flags = flags;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_read(int fd, std::size_t pos, std::uint8_t *buf, std::size_t size,
-                           std::uint32_t flags, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_READ,
-                       .fd = fd,
-                       .off = pos,
-                       .addr = std::bit_cast<std::uint64_t>(buf),
-                       .len = static_cast<std::uint32_t>(size),
-                       .rw_flags = flags,
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_pread(int fd, size_t pos, uint8_t *buf, uint32_t size,
+                           uint32_t flags, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_READ;
+    sqe.fd = fd;
+    sqe.off = pos;
+    sqe.addr = reinterpret_cast<uint64_t>(buf);
+    sqe.len = size;
+    sqe.rw_flags = flags;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_write(int fd, std::size_t pos, const std::uint8_t *buf, std::size_t size,
-                            std::uint32_t flags, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_WRITE,
-                       .fd = fd,
-                       .off = pos,
-                       .addr = std::bit_cast<std::uint64_t>(buf),
-                       .len = static_cast<std::uint32_t>(size),
-                       .rw_flags = flags,
-                       .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_pwrite(int fd, size_t pos, const uint8_t *buf, uint32_t size,
+                            uint32_t flags, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_WRITE;
+    sqe.fd = fd;
+    sqe.off = pos;
+    sqe.addr = reinterpret_cast<uint64_t>(buf);
+    sqe.len = size;
+    sqe.rw_flags = flags;
+    sqe.user_data = user_data;
 }
 
-void IOUring::sq_push_close(int fd, std::uint64_t user_data) {
-    sq_ensure_space();
-    std::uint32_t index = sq_new_tail_++ & sq_mask_;
-    sq_sqes_[index] = {.opcode = IORING_OP_CLOSE, .fd = fd, .user_data = user_data};
-    sq_array_[index] = index;
-    to_submit_++;
+void IOUring::sq_push_close(int fd, uint64_t user_data) {
+    io_uring_sqe &sqe = sq_slot();
+    sqe.opcode = IORING_OP_CLOSE;
+    sqe.fd = fd;
+    sqe.user_data = user_data;
 }
 
 /**
@@ -349,3 +308,4 @@ void IOUring::cq_start_pop() { cq_new_head_ = load_acquire(cq_head_); }
 void IOUring::cq_end_pop() { store_release(cq_head_, cq_new_head_); }
 
 } // namespace wolf::internal
+
