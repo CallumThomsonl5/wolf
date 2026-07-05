@@ -78,6 +78,7 @@ static void on_read(wolf::FileView file, void *ctx, std::span<uint8_t> buf, uint
 static void on_write(wolf::FileView file, void *ctx, std::span<const uint8_t> buf, uint64_t off, uint64_t tok, wolf::FileError err) {
     if (err != wolf::FileError::Ok) {
         std::cout << "write error\n";
+        return;
     }
 
     std::cout << "write complete\n";
@@ -102,7 +103,15 @@ int main(void) {
             std::puts("file open");
             file.set_onread(on_read);
             file.set_onwrite(on_write);
-            file.write_to(1, std::span{(const uint8_t*)write_data, strlen(write_data)});
+            file.write_to(100, std::span{(const uint8_t*)write_data, strlen(write_data)});
+            file.close();
+        },
+        [](wolf::FileView file, void *ctx, wolf::FileError err) {
+            if (err != wolf::FileError::Ok) {
+                std::cout << "file close error\n";
+            }
+
+            std::puts("file closed");
         }
     );
 

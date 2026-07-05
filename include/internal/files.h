@@ -47,6 +47,7 @@ struct File {
     int flags;
     uint32_t gen;
     BoundedRingBuffer<FileOp, MAX_INFLIGHT_FILE_OPS> ops_queue;
+    bool closing;
 };
 
 
@@ -81,7 +82,7 @@ public:
     FileSubsystem(EventLoop &loop, IOUring &ring, int thread_id);
 
     void open(const char *path, FileOpenMode mode, FileOpenOptions options, int perms,
-                   void *context, OnOpen on_open);
+                   void *context, OnOpen on_open, OnFileClose on_close);
     void handle_open(Handle handle, int result, uint32_t flags);
 
     void read_from(Handle handle, uint64_t off, uint8_t *buf, uint64_t len, uint64_t token);
@@ -90,6 +91,9 @@ public:
 
     void set_onread(Handle handle, OnRead on_read);
     void set_onwrite(Handle handle, OnWrite on_write);
+
+    void close(Handle handle);
+    void handle_close(Handle handle, int result, uint32_t flags);
 
 private:
     void handle_read_from(InFlightFileIO &inflight, int inflight_index, File &file, int result, uint32_t flags);
@@ -111,3 +115,4 @@ private:
 };
 
 } // namespace wolf::internal
+

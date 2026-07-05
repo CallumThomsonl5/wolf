@@ -19,7 +19,8 @@ enum class MessageType : uint8_t {
     FileOpen,
     FileIO,
     FileSetOnRead,
-    FileSetOnWrite
+    FileSetOnWrite,
+    FileClose
 };
 
 struct CreateListenerMessage {
@@ -75,6 +76,7 @@ struct FileOpenMessage {
     int perms;
     void *context;
     OnOpen on_open;
+    OnFileClose on_close;
 };
 
 struct FileIOMessage {
@@ -99,6 +101,10 @@ struct FileSetOnWrite {
     uint64_t handle;
 };
 
+struct FileClose {
+    uint64_t handle;
+};
+
 /**
  * @internal
  * @brief Used for passing messages between event loops.
@@ -117,6 +123,7 @@ struct Message {
         FileIOMessage file_io;
         FileSetOnRead file_set_onread;
         FileSetOnWrite file_set_onwrite;
+        FileClose file_close;
     } msg;
     MessageType type;
 };

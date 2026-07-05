@@ -22,6 +22,7 @@ enum class Op : uint8_t {
     Timer,
     FileOpen,
     FileIO,
+    FileClose,
     Wake,
 };
 
@@ -82,6 +83,8 @@ inline std::string handle_to_string(Handle h) {
             return "FileOpen";
         case Op::FileIO:
             return "FileIO";
+        case Op::FileClose:
+            return "FileClose";
         case Op::Wake:
             return "Wake";
         default:
@@ -94,3 +97,4 @@ inline std::string handle_to_string(Handle h) {
 }
 
 } // namespace wolf::internal
+

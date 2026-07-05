@@ -14,7 +14,9 @@ class FileView;
 enum class FileError;
 
 using OnOpen = void (*)(FileView file, void *context, FileError err);
-using OnFileClose = void (*)();
+using OnFileClose = void (*)(FileView view,
+                             void *file_ctx,
+                             FileError err);
 using OnRead = void (*)(FileView file,
                         void *file_ctx,
                         std::span<uint8_t> buf,
@@ -36,12 +38,13 @@ enum class FileOpenMode { Read = O_RDONLY, Write = O_WRONLY, RdWr = O_RDWR };
  */
 enum class FileError {
     Ok = 0,
-    BufferFull,
+    QueueFull,
     DoesNotExist,
     InsufficientPermissions,
     AlreadyExists,
     IsDirectory,
     NoSpace,
+    Closing,
     Unknown
 };
 

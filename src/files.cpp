@@ -2,6 +2,7 @@
 #include <internal/iouring.h>
 #include <internal/handle.h>
 
+#include <iostream>
 #include <wolf.h>
 #include <files.h>
 
@@ -30,7 +31,7 @@ FileSubsystem::FileSubsystem(EventLoop &loop, IOUring &ring, int thread_id):
  * @brief initiates a file open getting a free File struct and then pushing an openat SQE.
  */
 void FileSubsystem::open(const char *path, FileOpenMode mode, FileOpenOptions options, int perms,
-                              void *context, OnOpen on_open)
+                              void *context, OnOpen on_open, OnFileClose on_close)
 {
     if (free_files_.empty()) {
         int size = files_.size();
@@ -50,13 +51,14 @@ void FileSubsystem::open(const char *path, FileOpenMode mode, FileOpenOptions op
     files_[index].on_open = on_open;
     files_[index].on_read = nullptr;
     files_[index].on_write = nullptr;
-    files_[index].on_close = nullptr;
+    files_[index].on_close = on_close;
     files_[index].inflight_ops = 0;
     files_[index].flags = flags;
     files_[index].ops_queue.clear();
+    files_[index].closing = false;
 
-    Handle handle = internal::make_handle(thread_id_, index, files_[index].gen);
-    ring_.sq_push_openat(path, flags, perms, set_op(handle, internal::Op::FileOpen));
+    Handle handle = make_handle(thread_id_, index, files_[index].gen);
+    ring_.sq_push_openat(path, flags, perms, set_op(handle, Op::FileOpen));
 }
 
 
@@ -96,11 +98,16 @@ void FileSubsystem::read_from(Handle handle, uint64_t off, uint8_t *buf, uint64_
         return;
     }
 
+    if (file.closing) {
+        FileView view{handle, loop_};
+        file.on_read(view, file.ctx, std::span<uint8_t>{buf, len}, off, token, FileError::Closing);
+    }
+
     if (file.inflight_ops >= MAX_INFLIGHT_FILE_OPS) {
         // we must reject this operation
         if (file.ops_queue.full()) {
             FileView view{handle, loop_};
-            file.on_read(view, file.ctx, std::span<uint8_t>{buf, len}, off, token, FileError::BufferFull);
+            file.on_read(view, file.ctx, std::span<uint8_t>{buf, len}, off, token, FileError::QueueFull);
             return;
         }
 
@@ -151,11 +158,16 @@ void FileSubsystem::write_to(Handle handle, uint64_t off, const uint8_t *buf, ui
         return;
     }
 
+    if (file.closing) {
+        FileView view{handle, loop_};
+        file.on_write(view, file.ctx, std::span<const uint8_t>{buf, len}, off, token, FileError::Closing);
+    }
+
     if (file.inflight_ops >= MAX_INFLIGHT_FILE_OPS) {
         // we must reject this operation
         if (file.ops_queue.full()) {
             FileView view{handle, loop_};
-            file.on_write(view, file.ctx, std::span<const uint8_t>{buf, len}, off, token, FileError::BufferFull);
+            file.on_write(view, file.ctx, std::span<const uint8_t>{buf, len}, off, token, FileError::QueueFull);
             return;
         }
 
@@ -203,7 +215,8 @@ void FileSubsystem::handle_io(Handle handle, int result, uint32_t flags) {
         return;
     }
 
-    File &file = files_[inflight.file_index];
+    uint32_t file_index = inflight.file_index;
+    File &file = files_[file_index];
     if (file.gen != inflight.file_gen) [[unlikely]] {
         inflight.op_gen = (inflight.op_gen + 1) & GENERATION_MASK;
         free_inflight_io_.push_back(get_index(handle));
@@ -217,6 +230,12 @@ void FileSubsystem::handle_io(Handle handle, int result, uint32_t flags) {
     case FileIOType::Write:
         handle_write_to(inflight, get_index(handle), file, result, flags);
         break;
+    }
+
+    // deal with closing
+    if (file.closing && file.inflight_ops == 0) {
+        ring_.sq_push_close(file.fd, 
+                set_op(make_handle(thread_id_, file_index, file.gen), Op::FileClose));
     }
 }
 
@@ -236,6 +255,37 @@ void FileSubsystem::set_onwrite(Handle handle, OnWrite on_write) {
     }
 
     file.on_write = on_write;
+}
+
+void FileSubsystem::close(Handle handle) {
+    File &file = files_[get_index(handle)];
+    if (file.gen != get_gen(handle)) [[unlikely]] {
+        return;
+    }
+    
+    file.closing = true;
+    if (file.inflight_ops == 0) {
+        ring_.sq_push_close(file.fd, set_op(handle, Op::FileClose));
+    }
+}
+
+void FileSubsystem::handle_close(Handle handle, int result, uint32_t flags) {
+    File &file = files_[get_index(handle)];
+    if (file.gen != get_gen(handle)) [[unlikely]] {
+        return;
+    }
+
+    if (result != 0) {
+        // TODO: fix this
+        assert(false);
+    }
+
+
+    FileView view{clear_op(handle), loop_};
+    file.on_close(view, file.ctx, FileError::Ok);
+
+    file.gen = (file.gen + 1) & GENERATION_MASK;
+    free_files_.push_back(get_index(handle));
 }
 
 
@@ -403,6 +453,10 @@ void FileView::set_onread(OnRead on_read) {
 
 void FileView::set_onwrite(OnWrite on_write) {
     loop_.file_set_onwrite(handle_, on_write);
+}
+
+void FileView::close() {
+    loop_.file_close(handle_);
 }
 
 } // namespace wolf

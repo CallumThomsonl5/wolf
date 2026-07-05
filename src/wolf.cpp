@@ -203,16 +203,17 @@ void EventLoop::tcp_connect(uint32_t host, uint16_t port, void *context,
 }
 
 void EventLoop::file_open(const char *path, FileOpenMode mode, FileOpenOptions options, int perms,
-                          void *context, OnOpen on_open) {
+                          void *context, OnOpen on_open, OnFileClose on_close) {
     if (thread_loop == this) {
-        file_.open(path, mode, options, perms, context, on_open);
+        file_.open(path, mode, options, perms, context, on_open, on_close);
     } else {
         post({.msg = {.file_open = {.path = path,
                                     .mode = mode,
                                     .options = options,
                                     .perms = perms,
                                     .context = context,
-                                    .on_open = on_open}},
+                                    .on_open = on_open,
+                                    .on_close = on_close}},
               .type = internal::MessageType::FileOpen});
     }
 }
@@ -242,6 +243,15 @@ void EventLoop::file_write_to(Handle handle, size_t off, const uint8_t *buf, siz
                                   .token = token,
                                   .handle = handle}},
               .type = internal::MessageType::FileIO});
+    }
+}
+
+void EventLoop::file_close(Handle handle) {
+    if (thread_loop == this) {
+        file_.close(handle);
+    } else {
+        post({.msg = {.file_close = {.handle = handle}},
+              .type = internal::MessageType::FileClose});
     }
 }
 
@@ -344,6 +354,9 @@ void EventLoop::handle_cqe(io_uring_cqe *cqe) {
     case internal::Op::FileIO:
         file_.handle_io(cqe->user_data, cqe->res, cqe->flags);
         break;
+    case internal::Op::FileClose:
+        file_.handle_close(cqe->user_data, cqe->res, cqe->flags);
+        break;
     case internal::Op::Timer:
         // Silence error
         break;
@@ -391,7 +404,7 @@ void EventLoop::handle_messages() {
         } break;
         case internal::MessageType::FileOpen: {
             internal::FileOpenMessage &msg = m.msg.file_open;
-            file_.open(msg.path, msg.mode, msg.options, msg.perms, msg.context, msg.on_open);
+            file_.open(msg.path, msg.mode, msg.options, msg.perms, msg.context, msg.on_open, msg.on_close);
         } break;
         case internal::MessageType::FileIO: {
             internal::FileIOMessage &msg = m.msg.file_io;
@@ -411,6 +424,10 @@ void EventLoop::handle_messages() {
         case internal::MessageType::FileSetOnWrite: {
             internal::FileSetOnWrite &msg = m.msg.file_set_onwrite;
             file_.set_onwrite(msg.handle, msg.on_write);
+        } break;
+        case internal::MessageType::FileClose: {
+            internal::FileClose &msg = m.msg.file_close;
+            file_.close(msg.handle);
         } break;
         }
     }
