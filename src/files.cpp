@@ -140,6 +140,61 @@ void FileSubsystem::read_from(Handle handle, uint64_t off, uint8_t *buf, uint64_
 
 /**
  * @internal
+ * @brief Writes to the given offset
+ */
+void FileSubsystem::write_to(Handle handle, uint64_t off, const uint8_t *buf, uint64_t len, uint64_t token) {
+    // TODO: deal with OOB index
+    File &file = files_[get_index(handle)];
+
+    // stale handle
+    if (get_gen(handle) != file.gen) [[unlikely]] {
+        return;
+    }
+
+    if (file.inflight_ops >= MAX_INFLIGHT_FILE_OPS) {
+        // we must reject this operation
+        if (file.ops_queue.full()) {
+            FileView view{handle, loop_};
+            file.on_write(view, file.ctx, std::span<const uint8_t>{buf, len}, off, token, FileError::BufferFull);
+            return;
+        }
+
+        file.ops_queue.push(File::FileOp{
+            .type = FileIOType::Write,
+            .off = off,
+            .len = len,
+            .buf = (uint8_t*)buf,
+            .token = token,
+            .flags = 0
+        });
+
+        return;
+    }
+
+    int inflight_index = get_free_inflight();
+    InFlightFileIO &inflight = inflight_io_[inflight_index];
+
+    inflight.file_index = get_index(handle);
+    inflight.file_gen = get_gen(handle);
+    inflight.type = FileIOType::Write;
+    inflight.flags = 0;
+
+    inflight.off = off;
+    inflight.buf = (uint8_t*)buf;
+    inflight.len = len;
+    inflight.token = token;
+
+    inflight.completed = 0;
+
+    file.inflight_ops++;
+
+    ring_.sq_push_pwrite(file.fd, off, buf, std::min((uint64_t)MAX_FILE_OP_SQE_SIZE, len), inflight.flags,
+            set_op(make_handle(thread_id_, inflight_index, inflight.op_gen), Op::FileIO));
+}
+
+
+/**
+ * @internal
  * @brief Handle file IO CQEs
  */
 void FileSubsystem::handle_io(Handle handle, int result, uint32_t flags) {
@@ -172,6 +227,15 @@ void FileSubsystem::set_onread(Handle handle, OnRead on_read) {
     }
 
     file.on_read = on_read;
+}
+
+void FileSubsystem::set_onwrite(Handle handle, OnWrite on_write) {
+    File &file = files_[get_index(handle)];
+    if (file.gen != get_gen(handle)) [[unlikely]] {
+        return;
+    }
+
+    file.on_write = on_write;
 }
 
 
@@ -219,7 +283,43 @@ void FileSubsystem::handle_read_from(InFlightFileIO &inflight, int inflight_inde
 }
 
 void FileSubsystem::handle_write_to(InFlightFileIO &inflight, int inflight_index, File &file, int result, uint32_t flags) {
-    assert(false);
+    if (result < 0) [[unlikely]] {
+        // TODO: set real error
+        FileView view{make_handle(thread_id_, inflight.file_index, file.gen), loop_};
+        file.on_write(view, file.ctx, std::span{inflight.buf, inflight.completed}, inflight.off, inflight.token, FileError::Unknown);
+
+        file.inflight_ops--;
+
+        // free the slot
+        inflight.op_gen = (inflight.op_gen + 1) & GENERATION_MASK;
+        free_inflight_io_.push_back(inflight_index);
+
+        maybe_issue_from_queue(file, inflight.file_index);
+        return;
+    }
+
+    uint32_t requested = std::min((uint64_t)MAX_FILE_OP_SQE_SIZE, inflight.len - inflight.completed);
+    inflight.completed += result;
+
+    if (result < requested || inflight.completed == inflight.len) {
+        FileView view{make_handle(thread_id_, inflight.file_index, file.gen), loop_};
+        file.on_write(view, file.ctx, std::span{inflight.buf, inflight.completed}, inflight.off, inflight.token, FileError::Ok);
+
+        file.inflight_ops--;
+
+        // free the slot
+        inflight.op_gen = (inflight.op_gen + 1) & GENERATION_MASK;
+        free_inflight_io_.push_back(inflight_index);
+
+        maybe_issue_from_queue(file, inflight.file_index);
+        return;
+    }
+
+    uint64_t off = inflight.off + inflight.completed;
+    uint8_t *buf = inflight.buf + inflight.completed;
+    uint64_t len = std::min((uint64_t)MAX_FILE_OP_SQE_SIZE, inflight.len - inflight.completed);
+    ring_.sq_push_pwrite(file.fd, off, buf, len, inflight.flags,
+        set_op(make_handle(thread_id_, inflight_index, inflight.op_gen), Op::FileIO));
 }
 
 /**
@@ -275,8 +375,8 @@ void FileSubsystem::maybe_issue_from_queue(File &file, int file_index) {
                 set_op(make_handle(thread_id_, inflight_index, inflight.op_gen), Op::FileIO));
             break;
         case FileIOType::Write:
-            // TODO: implement
-            assert(false); 
+            ring_.sq_push_pwrite(file.fd, op.off, op.buf, std::min((uint64_t)MAX_FILE_OP_SQE_SIZE, op.len), op.flags,
+                set_op(make_handle(thread_id_, inflight_index, inflight.op_gen), Op::FileIO));
             break;
         }
 
@@ -293,8 +393,16 @@ void FileView::read_from(size_t off, std::span<uint8_t> buf, uint64_t token) {
     loop_.file_read_from(handle_, off, buf.data(), buf.size(), token);
 }
 
+void FileView::write_to(size_t off, std::span<const uint8_t> buf, uint64_t token) {
+    loop_.file_write_to(handle_, off, buf.data(), buf.size(), token);
+}
+
 void FileView::set_onread(OnRead on_read) {
     loop_.file_set_onread(handle_, on_read);
+}
+
+void FileView::set_onwrite(OnWrite on_write) {
+    loop_.file_set_onwrite(handle_, on_write);
 }
 
 } // namespace wolf

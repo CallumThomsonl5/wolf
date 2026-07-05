@@ -174,7 +174,10 @@ public:
     void file_open(const char *path, FileOpenMode mode, FileOpenOptions options, int perms, void *context,
                    OnOpen on_open);
     void file_read_from(Handle handle, size_t off, uint8_t *buf, size_t len, uint64_t token);
+    void file_write_to(Handle handle, size_t off, const uint8_t *buf, size_t len, uint64_t token);
+
     void file_set_onread(Handle handle, OnRead on_read);
+    void file_set_onwrite(Handle handle, OnWrite on_write);
 
     Handle set_timeout(OnTimeout on_timeout, void *context, uint64_t);
     Handle set_interval(OnTimeout on_timeout, void *context, uint64_t);

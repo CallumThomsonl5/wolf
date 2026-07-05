@@ -1,4 +1,7 @@
 #include "files.h"
+#include "internal/files.h"
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
@@ -72,6 +75,18 @@ static void on_read(wolf::FileView file, void *ctx, std::span<uint8_t> buf, uint
     std::cout << "file contents: " << sv << "size: " << buf.size() << '\n';
 }
 
+static void on_write(wolf::FileView file, void *ctx, std::span<const uint8_t> buf, uint64_t off, uint64_t tok, wolf::FileError err) {
+    if (err != wolf::FileError::Ok) {
+        std::cout << "write error\n";
+    }
+
+    std::cout << "write complete\n";
+
+    if (tok == 1) {
+        std::cout << "size : " << buf.size() << '\n';
+    }
+}
+
 int main(void) {
     wolf::EventLoop loop;
     // use raw address for now until async getaddrinfo is added.
@@ -81,11 +96,13 @@ int main(void) {
         loop.set_timeout([](void *context) { std::puts("timeout"); }, nullptr, 1000);
 
     loop.file_open(
-        "./fuck.txt", wolf::FileOpenMode::Read, wolf::FileOpenOptions::Create, 0666, nullptr,
+        "./fuck.txt", wolf::FileOpenMode::RdWr, wolf::FileOpenOptions::Create, 0666, nullptr,
         [](wolf::FileView file, void *context, wolf::FileError err) {
+            const char *write_data = "some data to write\n";
             std::puts("file open");
             file.set_onread(on_read);
-            file.read_from(0, std::span{(uint8_t*)READ_BUFFER, sizeof(READ_BUFFER)});
+            file.set_onwrite(on_write);
+            file.write_to(1, std::span{(const uint8_t*)write_data, strlen(write_data)});
         }
     );
 

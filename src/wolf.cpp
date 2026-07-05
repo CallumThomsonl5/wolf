@@ -231,6 +231,20 @@ void EventLoop::file_read_from(Handle handle, size_t off, uint8_t *buf, size_t l
     }
 }
 
+void EventLoop::file_write_to(Handle handle, size_t off, const uint8_t *buf, size_t len, uint64_t token) {
+    if (thread_loop == this) {
+        file_.write_to(handle, off, buf, len, token);
+    } else {
+        post({.msg = {.file_io = {.type = internal::FileIOMessage::Type::Write,
+                                  .off = off,
+                                  .buf = (uint8_t*)buf,
+                                  .len = len,
+                                  .token = token,
+                                  .handle = handle}},
+              .type = internal::MessageType::FileIO});
+    }
+}
+
 void EventLoop::file_set_onread(Handle handle, OnRead on_read) {
     if (thread_loop == this) {
         file_.set_onread(handle, on_read);
@@ -238,6 +252,16 @@ void EventLoop::file_set_onread(Handle handle, OnRead on_read) {
         post({.msg = {.file_set_onread = {.on_read = on_read,
                                           .handle = handle}},
               .type = internal::MessageType::FileSetOnRead});
+    }
+}
+
+void EventLoop::file_set_onwrite(Handle handle, OnWrite on_write) {
+    if (thread_loop == this) {
+        file_.set_onwrite(handle, on_write);
+    } else {
+        post({.msg = {.file_set_onwrite = {.on_write = on_write,
+                                          .handle = handle}},
+              .type = internal::MessageType::FileSetOnWrite});
     }
 }
 
@@ -371,11 +395,22 @@ void EventLoop::handle_messages() {
         } break;
         case internal::MessageType::FileIO: {
             internal::FileIOMessage &msg = m.msg.file_io;
-            file_.read_from(msg.handle, msg.off, msg.buf, msg.len, msg.token);
+            switch (msg.type) {
+            case internal::FileIOMessage::Type::Read:
+                file_.read_from(msg.handle, msg.off, msg.buf, msg.len, msg.token);
+                break;
+            case internal::FileIOMessage::Type::Write:
+                file_.write_to(msg.handle, msg.off, msg.buf, msg.len, msg.token);
+                break;
+            }
         } break;
         case internal::MessageType::FileSetOnRead: {
             internal::FileSetOnRead &msg = m.msg.file_set_onread;
             file_.set_onread(msg.handle, msg.on_read);
+        } break;
+        case internal::MessageType::FileSetOnWrite: {
+            internal::FileSetOnWrite &msg = m.msg.file_set_onwrite;
+            file_.set_onwrite(msg.handle, msg.on_write);
         } break;
         }
     }

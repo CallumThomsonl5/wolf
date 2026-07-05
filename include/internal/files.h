@@ -85,10 +85,11 @@ public:
     void handle_open(Handle handle, int result, uint32_t flags);
 
     void read_from(Handle handle, uint64_t off, uint8_t *buf, uint64_t len, uint64_t token);
-    void write_to();
+    void write_to(Handle handle, uint64_t off, const uint8_t *buf, uint64_t len, uint64_t token);
     void handle_io(Handle handle, int result, uint32_t flags);
 
     void set_onread(Handle handle, OnRead on_read);
+    void set_onwrite(Handle handle, OnWrite on_write);
 
 private:
     void handle_read_from(InFlightFileIO &inflight, int inflight_index, File &file, int result, uint32_t flags);

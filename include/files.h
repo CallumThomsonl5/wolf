@@ -21,7 +21,12 @@ using OnRead = void (*)(FileView file,
                         uint64_t offset,
                         uint64_t token,
                         FileError err);
-using OnWrite = void (*)();
+using OnWrite = void (*)(FileView file,
+                        void *file_ctx,
+                        std::span<const uint8_t> buf,
+                        uint64_t offset,
+                        uint64_t token,
+                        FileError err);
 using OnSize = void (*)();
 
 enum class FileOpenMode { Read = O_RDONLY, Write = O_WRONLY, RdWr = O_RDWR };
@@ -67,6 +72,7 @@ public:
     void write_to(size_t off, std::span<const uint8_t>, uint64_t token = 0);
 
     void set_onread(OnRead on_read);
+    void set_onwrite(OnWrite on_write);
 
     void get_size(OnSize on_size);
 
